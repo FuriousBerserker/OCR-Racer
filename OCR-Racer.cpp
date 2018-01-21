@@ -26,7 +26,7 @@
 #define INSTRUMENT
 #define DETECT_RACE
 #define MEASURE_TIME
-#define OUTPUT_CG
+//#define OUTPUT_CG
 
 class Node;
 class Task;
@@ -312,7 +312,11 @@ bool ComputationGraph::isReachable(uint64_t srcID, uint32_t srcEpoch,
             for (auto it = next->incomingEdges.begin(),
                       ie = next->incomingEdges.end();
                  it != ie; it++) {
-                q.push(it->second.src);
+                 Node* ancestor = it->second.src;
+                 while (ancestor->type == Node::EVENT && ancestor->incomingEdges.size() == 1) {
+                    ancestor = ancestor->incomingEdges.begin()->second.src; 
+                 }
+                q.push(ancestor);
             }
         }
     }
@@ -340,10 +344,16 @@ void ComputationGraph::toDot(std::ostream& out) {
 #ifdef DEBUG
     cout << "CG2Dot" << endl;
 #endif
-
+    //used to filter redundant nodes, since we may point multiple ID to a single node, for instance, we point an output event's ID to the associated task
+    //std::set<Node*> accessedNode;
     out << "digraph ComputationGraph {" << endl;
     for (auto ci = nodeMap.begin(), ce = nodeMap.end(); ci != ce; ++ci) {
         Node* node = (*ci).second;
+        //if (accessedNode.find(node) == accessedNode.end()) {
+            //accessedNode.insert(node);
+        //} else {
+            //continue;
+        //}
         string nodeColor = nodeColorSchemes.find(node->type)->second.toString();
         if (node->type == Node::TASK) {
             uint32_t finalEpoch = epochMap.get(node->id);
@@ -356,12 +366,19 @@ void ComputationGraph::toDot(std::ostream& out) {
         }
     }
 
+    //accessedNode.clear();
     for (auto ci = nodeMap.begin(), ce = nodeMap.end(); ci != ce; ++ci) {
         Node* node = (*ci).second;
+        //if (accessedNode.find(node) == accessedNode.end()) {
+            //accessedNode.insert(node);
+        //} else {
+            //continue;
+        //}
+
         if (node->type == Node::TASK) {
             if (node->parent) {
                 outputLink(out, node->parent, node->parentEpoch, node,
-                           START_EPOCH, Node::SPAWN);
+                           START_EPOCH + 1, Node::SPAWN);
             }
             for (auto di = node->incomingEdges.begin(),
                       de = node->incomingEdges.end();
@@ -370,7 +387,7 @@ void ComputationGraph::toDot(std::ostream& out) {
                 outputLink(out, dep.src,
                            dep.epoch == END_EPOCH ? epochMap.get(dep.src->id)
                                                   : dep.epoch,
-                           node, START_EPOCH, Node::JOIN);
+                           node, START_EPOCH + 1, Node::JOIN);
             }
             uint32_t finalEpoch = epochMap.get(node->id);
             for (uint32_t i = START_EPOCH + 1; i < finalEpoch; i++) {
@@ -384,7 +401,7 @@ void ComputationGraph::toDot(std::ostream& out) {
                 outputLink(out, dep.src,
                            dep.epoch == END_EPOCH ? epochMap.get(dep.src->id)
                                                   : dep.epoch,
-                           node, START_EPOCH, Node::JOIN);
+                           node, START_EPOCH + 1, Node::JOIN);
             }
         }
     }
@@ -453,7 +470,16 @@ void afterEdtCreate(THREADID tid, ocrGuid_t guid, ocrGuid_t templateGuid,
     computationGraph.insert(taskID, task);
     if (!isNullGuid(outputEvent)) {
         uint64_t eventID = guidMap.get(outputEvent.guid);
-        computationGraph.insert(eventID, task);
+        //if (properties == EDT_PROP_FINISH) {
+            //Node* finishEvent = computationGraph.getNode(eventID);
+            //Dep dep(task);
+            //finishEvent->addDeps(taskID, dep);
+        //} else {
+            //computationGraph.insert(eventID, task);
+        //}    
+        Node* finishEvent = computationGraph.getNode(eventID);
+        Dep dep(task);
+        finishEvent->addDeps(taskID, dep);
     }
 #ifdef DEBUG
     *out << "afterEdtCreate finish" << endl;
@@ -570,6 +596,13 @@ void fini(int32_t code, void* v) {
     double time_span = program_end - program_start;
     time_span /= CLOCKS_PER_SEC;
     *out << "elapsed time: " << time_span << " seconds" << endl;
+#endif
+
+#ifdef OUTPUT_CG
+    ofstream dotFile;
+    dotFile.open("cg.dot");
+    computationGraph.toDot(dotFile);
+    dotFile.close();
 #endif
     // errorFile.close();
     // logFile.close();
