@@ -30,3 +30,9 @@
 *.exe
 *.out
 *.app
+
+# Vim temp file
+*.swp
+
+# Folder for build
+obj-intel64/
