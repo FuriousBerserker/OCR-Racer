@@ -26,7 +26,7 @@
 #define INSTRUMENT
 #define DETECT_RACE
 #define MEASURE_TIME
-//#define OUTPUT_CG
+#define OUTPUT_CG
 
 class Node;
 class Task;
@@ -126,12 +126,27 @@ class ColorScheme {
 };
 #endif
 
-class Dep {
+struct Dep {
    public:
     Node* src;
     uint32_t epoch;
     Dep(Node* src, uint32_t epoch = END_EPOCH) : src(src), epoch(epoch) {}
+    Dep(const Dep& other) : Dep(other.src, other.epoch) {}
     virtual ~Dep() {}
+
+    // Dep& operator=(const Dep& other) {
+    // this->src = other.src;
+    // this->epoch = other.epoch;
+    // return *this;
+    //}
+    //
+    // friend bool operator==(const Dep& a, const Dep& b) {
+    // return a.src == b.src && a.epoch == b.epoch;
+    //}
+    //
+    // friend bool operator!=(const Dep& a, const Dep& b) {
+    // return !(a == b);
+    //}
 };
 
 class Node {
@@ -140,7 +155,8 @@ class Node {
     enum EdgeType { SPAWN, JOIN, CONTINUE };
 
    protected:
-    std::unordered_map<uint64_t, Dep> incomingEdges;
+    ConcurrentHashMap<uint64_t, Dep*, nullptr, IdentityHash<uint64_t> >
+        incomingEdges;
     Task* parent;
     uint32_t parentEpoch;
     Type type;
@@ -192,7 +208,7 @@ class ComputationGraph {
     Node* getNode(uint64_t key);
     bool isReachable(uint64_t srcID, uint32_t srcEpoch, uint64_t dstID,
                      uint32_t dstEpoch);
-    void updateCache(uint64_t srcID, uint32_t srcEpoch, uint32_t dstID);
+    void updateCache(uint64_t srcID, uint32_t srcEpoch, uint64_t dstID);
     void updateTaskFinalEpoch(uint64_t taskID, uint32_t epoch);
 #ifdef OUTPUT_CG
     void toDot(std::ostream& out);
@@ -229,7 +245,7 @@ class ThreadLocalStore {
 };
 
 Node::Node(uint64_t id, Type type, Task* parent, uint32_t parentEpoch)
-    : incomingEdges(),
+    : incomingEdges(10),
       parent(parent),
       parentEpoch(parentEpoch),
       type(type),
@@ -238,7 +254,9 @@ Node::Node(uint64_t id, Type type, Task* parent, uint32_t parentEpoch)
 Node::~Node() {}
 
 inline void Node::addDeps(uint64_t id, Dep& dep) {
-    incomingEdges.insert(std::make_pair(id, dep));
+    Dep* copy = new Dep(dep);
+    incomingEdges.put(id, copy);
+    //*out << id << "#" << dep.epoch << "->" << this->id << std::endl;
 }
 
 Task::Task(uint64_t id, Task* parent, uint32_t parentEpoch)
@@ -287,17 +305,17 @@ bool ComputationGraph::isReachable(uint64_t srcID, uint32_t srcEpoch,
     bool result = false;
     queue<Node*> q;
     q.push(dstNode);
-    uint64_t cacheKey = generateCacheKey(srcID, dstID);
-    uint32_t cacheEpoch = cacheMap.get(cacheKey);
-    if (cacheEpoch >= srcEpoch) {
-        result = true;
-    } else {
-        while (!q.empty()) {
-            Node* next = q.front();
-            q.pop();
-            auto search = next->incomingEdges.find(srcID);
-            if (search != next->incomingEdges.end() &&
-                search->second.epoch >= srcEpoch) {
+    while (!q.empty()) {
+        Node* next = q.front();
+        q.pop();
+        uint64_t cacheKey = generateCacheKey(srcID, next->id);
+        uint32_t cacheEpoch = cacheMap.get(cacheKey);
+        if (cacheEpoch >= srcEpoch) {
+            result = true;
+            break;
+        } else {
+            Dep* search = next->incomingEdges.get(srcID);
+            if (search && search->epoch >= srcEpoch) {
                 result = true;
                 break;
             }
@@ -306,20 +324,26 @@ bool ComputationGraph::isReachable(uint64_t srcID, uint32_t srcEpoch,
                 result = true;
                 break;
             }
-            if (next->parent) {
+            if (next->parent && next->parent->id != srcID) {
                 q.push(next->parent);
             }
             for (auto it = next->incomingEdges.begin(),
                       ie = next->incomingEdges.end();
-                 it != ie; it++) {
-                 Node* ancestor = it->second.src;
-                 while (ancestor->type == Node::EVENT && ancestor->incomingEdges.size() == 1) {
-                    ancestor = ancestor->incomingEdges.begin()->second.src; 
-                 }
+                 it != ie; ++it) {
+                Node* ancestor = (*it).second->src;
+                if (ancestor->id == srcID) {
+                    continue;
+                }
+                while (ancestor->type == Node::EVENT &&
+                       ancestor->incomingEdges.getSize() == 1) {
+                    auto it = ancestor->incomingEdges.begin();
+                    ancestor = (*it).second->src;
+                }
                 q.push(ancestor);
             }
         }
     }
+
     if (result) {
         updateCache(srcID, srcEpoch, dstID);
     }
@@ -327,7 +351,7 @@ bool ComputationGraph::isReachable(uint64_t srcID, uint32_t srcEpoch,
 }
 
 void ComputationGraph::updateCache(uint64_t srcID, uint32_t srcEpoch,
-                                   uint32_t dstID) {
+                                   uint64_t dstID) {
     uint64_t cacheKey = generateCacheKey(srcID, dstID);
     if (cacheMap.get(cacheKey) < srcEpoch) {
         cacheMap.put(cacheKey, srcEpoch);
@@ -344,15 +368,17 @@ void ComputationGraph::toDot(std::ostream& out) {
 #ifdef DEBUG
     cout << "CG2Dot" << endl;
 #endif
-    //used to filter redundant nodes, since we may point multiple ID to a single node, for instance, we point an output event's ID to the associated task
-    //std::set<Node*> accessedNode;
+    cout << "node num = " << nodeMap.getSize() << endl;
+    // used to filter redundant nodes, since we may point multiple ID to a
+    // single node, for instance, we point an output event's ID to the associated
+    // task  std::set<Node*> accessedNode;
     out << "digraph ComputationGraph {" << endl;
     for (auto ci = nodeMap.begin(), ce = nodeMap.end(); ci != ce; ++ci) {
         Node* node = (*ci).second;
-        //if (accessedNode.find(node) == accessedNode.end()) {
-            //accessedNode.insert(node);
+        // if (accessedNode.find(node) == accessedNode.end()) {
+        // accessedNode.insert(node);
         //} else {
-            //continue;
+        // continue;
         //}
         string nodeColor = nodeColorSchemes.find(node->type)->second.toString();
         if (node->type == Node::TASK) {
@@ -366,15 +392,15 @@ void ComputationGraph::toDot(std::ostream& out) {
         }
     }
 
-    //accessedNode.clear();
+    // accessedNode.clear();
     for (auto ci = nodeMap.begin(), ce = nodeMap.end(); ci != ce; ++ci) {
         Node* node = (*ci).second;
-        //if (accessedNode.find(node) == accessedNode.end()) {
-            //accessedNode.insert(node);
+        // if (accessedNode.find(node) == accessedNode.end()) {
+        // accessedNode.insert(node);
         //} else {
-            //continue;
+        // continue;
         //}
-
+        
         if (node->type == Node::TASK) {
             if (node->parent) {
                 outputLink(out, node->parent, node->parentEpoch, node,
@@ -383,10 +409,10 @@ void ComputationGraph::toDot(std::ostream& out) {
             for (auto di = node->incomingEdges.begin(),
                       de = node->incomingEdges.end();
                  di != de; ++di) {
-                Dep& dep = di->second;
-                outputLink(out, dep.src,
-                           dep.epoch == END_EPOCH ? epochMap.get(dep.src->id)
-                                                  : dep.epoch,
+                Dep* dep = (*di).second;
+                outputLink(out, dep->src,
+                           (dep->epoch == END_EPOCH ? epochMap.get(dep->src->id)
+                                                  : dep->epoch),
                            node, START_EPOCH + 1, Node::JOIN);
             }
             uint32_t finalEpoch = epochMap.get(node->id);
@@ -397,10 +423,10 @@ void ComputationGraph::toDot(std::ostream& out) {
             for (auto di = node->incomingEdges.begin(),
                       de = node->incomingEdges.end();
                  di != de; ++di) {
-                Dep& dep = di->second;
-                outputLink(out, dep.src,
-                           dep.epoch == END_EPOCH ? epochMap.get(dep.src->id)
-                                                  : dep.epoch,
+                Dep* dep = (*di).second;
+                outputLink(out, dep->src,
+                           (dep->epoch == END_EPOCH ? epochMap.get(dep->src->id)
+                                                  : dep->epoch),
                            node, START_EPOCH + 1, Node::JOIN);
             }
         }
@@ -470,16 +496,16 @@ void afterEdtCreate(THREADID tid, ocrGuid_t guid, ocrGuid_t templateGuid,
     computationGraph.insert(taskID, task);
     if (!isNullGuid(outputEvent)) {
         uint64_t eventID = guidMap.get(outputEvent.guid);
-        //if (properties == EDT_PROP_FINISH) {
-            //Node* finishEvent = computationGraph.getNode(eventID);
-            //Dep dep(task);
-            //finishEvent->addDeps(taskID, dep);
+        // if (properties == EDT_PROP_FINISH) {
+        // Node* finishEvent = computationGraph.getNode(eventID);
+        // Dep dep(task);
+        // finishEvent->addDeps(taskID, dep);
         //} else {
-            //computationGraph.insert(eventID, task);
-        //}    
-        Node* finishEvent = computationGraph.getNode(eventID);
+        // computationGraph.insert(eventID, task);
+        //}
+        Node* associatedEvent = computationGraph.getNode(eventID);
         Dep dep(task);
-        finishEvent->addDeps(taskID, dep);
+        associatedEvent->addDeps(taskID, dep);
     }
 #ifdef DEBUG
     *out << "afterEdtCreate finish" << endl;
@@ -541,6 +567,7 @@ void afterEventSatisfy(THREADID tid, ocrGuid_t edtGuid, ocrGuid_t eventGuid,
         static_cast<ThreadLocalStore*>(PIN_GetThreadData(tls_key, tid));
     Dep dep(triggerTask, tls->getEpoch());
     tls->increaseEpoch();
+    assert(event != nullptr);
     event->addDeps(triggerTaskID, dep);
 #ifdef DEBUG
     cout << "afterEventSatisfy finish" << endl;
@@ -796,12 +823,12 @@ void overload(IMG img, void* v) {
             // PROTO_Free(proto_notifyEventPropagate);
             //}
 
-#ifdef OUTPUT_CG
         // replace notifyEdtTerminate
         rtn = RTN_FindByName(img, "notifyEdtTerminate");
         if (RTN_Valid(rtn)) {
 #ifdef DEBUG
             *out << "replace notifyEdtTerminate";
+#endif
             PROTO proto_notifyEdtTerminate = PROTO_Allocate(
                 PIN_PARG(void), CALLINGSTD_DEFAULT, "notifyEdtTerminate",
                 PIN_PARG_AGGREGATE(ocrGuid_t), PIN_PARG_END());
@@ -810,9 +837,7 @@ void overload(IMG img, void* v) {
                                  IARG_THREAD_ID, IARG_FUNCARG_ENTRYPOINT_VALUE,
                                  0, IARG_END);
             PROTO_Free(proto_notifyEdtTerminate);
-#endif
         }
-#endif
     }
 }
 
