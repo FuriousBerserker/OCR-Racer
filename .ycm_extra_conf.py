@@ -57,6 +57,11 @@ flags = [
 #'/usr/local/include',
 #'-isystem',
 #'/usr/include/x86_64-linux-gnu',
+'-DDEBUG',
+'-DOUTPUT_CG',
+'-DINSTRUMENT',
+'-DDETECT_RACE',
+'-DMEASURE_TIME',
 '-I',
 '/home/berserker/Software/pin-3.5-97503-gac534ca30-gcc-linux/source/include/pin',
 '-I',
@@ -83,6 +88,8 @@ flags = [
 '/home/berserker/Repository/ConcurrentDataStructure/inc',
 '-I',
 'inc',
+'-I',
+'./',
 '-c',
 ]
 

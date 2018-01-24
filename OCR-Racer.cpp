@@ -1,12 +1,16 @@
 
-/*! @file
+/*!next->parent->id == srcID @file
+ *
  *  This is an example of the PIN tool that demonstrates some basic PIN APIs
  *  and could serve as the starting point for developing your first PIN tool
  */
 
+#define __USE_PIN_CAS
+
 #include <cassert>
 #include <cinttypes>
 #include <cstddef>
+#include <cstring>
 #include <ctime>
 #include <fstream>
 #include <iostream>
@@ -15,35 +19,21 @@
 #include <set>
 #include <string>
 #include <unordered_map>
+#include <vector>
 #include "pin.H"
-#define __USE_PIN_CAS
 #include "ConcurrentHashMap.hpp"
 #include "atomic/ops-enum.hpp"
 #include "atomic/ops.hpp"
 #include "ocr-types.h"
-
-//#define DEBUG
-#define INSTRUMENT
-#define DETECT_RACE
-#define MEASURE_TIME
-#define OUTPUT_CG
-
-class Node;
-class Task;
-class DataBlock;
-class Event;
-class ComputationMap;
+#include "const_val.hpp"
+#include "computation_graph.hpp"
+#include "ocr_race_util.hpp"
 
 #ifdef MEASURE_TIME
 clock_t program_start, program_end;
 #endif
 
-const uint32_t NULL_ID = 0;
 
-const uint32_t START_EPOCH = 0;
-const uint32_t END_EPOCH = 0xFFFFFFFF;
-
-uint32_t nextTaskID = 1;
 
 // guid ---> task ID map
 ConcurrentHashMap<uint64_t, uint64_t, NULL_ID, IdentityHash<uint64_t> > guidMap(
@@ -64,31 +54,9 @@ std::ostream* err = &cerr;
 // std::ofstream logFile, errorFile;
 // std::ostream *out = &logFile;
 // std::ostream *err = &errorFile;
-inline uint64_t generateTaskID() {
-    bool success = false;
-    uint32_t nextID;
-    do {
-        nextID = ATOMIC::OPS::Load(&nextTaskID, ATOMIC::BARRIER_LD_NEXT);
-        success =
-            ATOMIC::OPS::CompareAndDidSwap(&nextTaskID, nextID, nextID + 1);
-    } while (!success);
-    return (uint64_t)nextID;
-}
 
-inline uint64_t generateCacheKey(const uint64_t& id1, const uint64_t& id2) {
-    return (id1 << 32) | id2;
-}
+ComputationGraph computationGraph(10000);
 
-/**
- * Test whether s2 is the suffix of s1
- */
-inline bool isEndWith(std::string& s1, std::string& s2) {
-    if (s1.size() < s2.size()) {
-        return false;
-    } else {
-        return !s1.compare(s1.size() - s2.size(), std::string::npos, s2);
-    }
-}
 
 inline bool isOCRLibrary(IMG img) {
     string ocrLibraryName = "libocr_x86.so";
@@ -100,10 +68,30 @@ inline bool isOCRLibrary(IMG img) {
     }
 }
 
+inline bool isUserCodeImg(IMG img) {
+    string imageName = IMG_Name(img);
+    if (imageName == userCodeImg) {
+        return true;
+    } else {
+        return false;
+    }
+}
+
+inline bool isIgnorableIns(INS ins) {
+    if (INS_IsStackRead(ins) || INS_IsStackWrite(ins)) return true;
+
+    // skip call, ret and JMP instructions
+    if (INS_IsBranchOrCall(ins) || INS_IsRet(ins)) {
+        return true;
+    }
+
+    return false;
+}
+
 /**
  * Test whether guid id NULL_GUID
  */
-bool isNullGuid(ocrGuid_t guid) {
+inline bool isNullGuid(ocrGuid_t guid) {
     if (guid.guid == NULL_GUID.guid) {
         return true;
     } else {
@@ -111,118 +99,6 @@ bool isNullGuid(ocrGuid_t guid) {
     }
 }
 
-#ifdef OUTPUT_CG
-class ColorScheme {
-   private:
-    string color;
-    string style;
-
-   public:
-    ColorScheme() {}
-    ColorScheme(std::string color, std::string style)
-        : color(color), style(style) {}
-    virtual ~ColorScheme() {}
-    string toString() { return "[color=" + color + ", style=" + style + "]"; }
-};
-#endif
-
-struct Dep {
-   public:
-    Node* src;
-    uint32_t epoch;
-    Dep(Node* src, uint32_t epoch = END_EPOCH) : src(src), epoch(epoch) {}
-    Dep(const Dep& other) : Dep(other.src, other.epoch) {}
-    virtual ~Dep() {}
-
-    // Dep& operator=(const Dep& other) {
-    // this->src = other.src;
-    // this->epoch = other.epoch;
-    // return *this;
-    //}
-    //
-    // friend bool operator==(const Dep& a, const Dep& b) {
-    // return a.src == b.src && a.epoch == b.epoch;
-    //}
-    //
-    // friend bool operator!=(const Dep& a, const Dep& b) {
-    // return !(a == b);
-    //}
-};
-
-class Node {
-   public:
-    enum Type { TASK, DB, EVENT };
-    enum EdgeType { SPAWN, JOIN, CONTINUE };
-
-   protected:
-    ConcurrentHashMap<uint64_t, Dep*, nullptr, IdentityHash<uint64_t> >
-        incomingEdges;
-    Task* parent;
-    uint32_t parentEpoch;
-    Type type;
-
-   public:
-    uint64_t id;
-
-   public:
-    Node(uint64_t id, Type type, Task* parent, uint32_t parentEpoch);
-    virtual ~Node();
-    void addDeps(uint64_t id, Dep& dep);
-
-    friend class ComputationGraph;
-};
-
-class Task : public Node {
-   public:
-    Task(uint64_t id, Task* parent, uint32_t parentEpoch);
-    virtual ~Task();
-};
-
-// class DataBlock : public Node {
-// public:
-// u16 accessMode;
-// DBNode(intptr_t id, u16 accessMode);
-// virtual ~DBNode();
-//};
-//
-
-class Event : public Node {
-   public:
-    Event(uint64_t id);
-    virtual ~Event();
-};
-
-class ComputationGraph {
-   private:
-    ConcurrentHashMap<uint64_t, Node*, nullptr, IdentityHash<uint64_t> >
-        nodeMap;
-    ConcurrentHashMap<uint64_t, uint32_t, START_EPOCH, IdentityHash<uint64_t> >
-        cacheMap;
-    ConcurrentHashMap<uint64_t, uint32_t, START_EPOCH, IdentityHash<uint64_t> >
-        epochMap;
-
-   public:
-    ComputationGraph(uint64_t capacity);
-    virtual ~ComputationGraph();
-    void insert(uint64_t key, Node* value);
-    Node* getNode(uint64_t key);
-    bool isReachable(uint64_t srcID, uint32_t srcEpoch, uint64_t dstID,
-                     uint32_t dstEpoch);
-    void updateCache(uint64_t srcID, uint32_t srcEpoch, uint64_t dstID);
-    void updateTaskFinalEpoch(uint64_t taskID, uint32_t epoch);
-#ifdef OUTPUT_CG
-    void toDot(std::ostream& out);
-#endif
-   private:
-#ifdef OUTPUT_CG
-    std::map<Node::Type, ColorScheme> nodeColorSchemes;
-    std::map<Node::EdgeType, ColorScheme> edgeColorSchemes;
-    void outputLink(ostream& out, Node* n1, u16 epoch1, Node* n2, u16 epoch2,
-                    Node::EdgeType edgeType);
-#endif
-};
-
-class ShadowMemory {};
 
 class ThreadLocalStore {
    public:
@@ -234,225 +110,17 @@ class ThreadLocalStore {
     }
     void increaseEpoch() { this->taskEpoch++; }
     uint32_t getEpoch() { return this->taskEpoch; }
-    // vector<DBPage*> acquiredDB;
-    // void initializeAcquiredDB(u32 dpec, ocrEdtDep_t* depv);
-    // void insertDB(ocrGuid_t& guid);
-    // DBPage* getDB(uintptr_t addr);
-    // void removeDB(DBPage* dbPage);
-
-    // private:
-    // bool searchDB(uintptr_t addr, DBPage** ptr, u64* offset);
+    //std::vector<DataBlockSM*> acquiredDB;
+    //void initializeAcquiredDB(uint32_t dpec, ocrEdtDep_t* depv);
+    //void insertDB(ocrGuid_t& guid);
+    //DataBlockSM* getDB(uintptr_t addr);
+    //void removeDB(DataBlock* dbPage);
+//
+    //private:
+    //bool searchDB(uintptr_t addr, DataBlockSM** ptr, uint64_t* offset);
 };
 
-Node::Node(uint64_t id, Type type, Task* parent, uint32_t parentEpoch)
-    : incomingEdges(10),
-      parent(parent),
-      parentEpoch(parentEpoch),
-      type(type),
-      id(id) {}
 
-Node::~Node() {}
-
-inline void Node::addDeps(uint64_t id, Dep& dep) {
-    Dep* copy = new Dep(dep);
-    incomingEdges.put(id, copy);
-    //*out << id << "#" << dep.epoch << "->" << this->id << std::endl;
-}
-
-Task::Task(uint64_t id, Task* parent, uint32_t parentEpoch)
-    : Node(id, Node::TASK, parent, parentEpoch) {}
-
-Task::~Task() {}
-
-Event::Event(uint64_t id) : Node(id, Node::EVENT, nullptr, END_EPOCH) {}
-
-Event::~Event() {}
-
-ComputationGraph::ComputationGraph(uint64_t hashUpperBound)
-    : nodeMap(hashUpperBound),
-      cacheMap(hashUpperBound),
-      epochMap(hashUpperBound) {
-#ifdef OUTPUT_CG
-    ColorScheme a("green", "filled"), b("yellow", "filled"),
-        c("blue", "filled");
-    nodeColorSchemes.insert(std::make_pair(Node::TASK, a));
-    nodeColorSchemes.insert(std::make_pair(Node::DB, b));
-    nodeColorSchemes.insert(std::make_pair(Node::EVENT, c));
-    ColorScheme e("red", "bold"), f("cyan", "bold"), g("black", "bold");
-    edgeColorSchemes.insert(std::make_pair(Node::SPAWN, e));
-    edgeColorSchemes.insert(std::make_pair(Node::JOIN, f));
-    edgeColorSchemes.insert(std::make_pair(Node::CONTINUE, g));
-#endif
-}
-
-ComputationGraph::~ComputationGraph() {}
-
-inline void ComputationGraph::insert(uint64_t key, Node* value) {
-    nodeMap.put(key, value);
-}
-
-inline Node* ComputationGraph::getNode(uint64_t key) {
-    return nodeMap.get(key);
-}
-
-// A BFS search to check the reachability between nodes
-bool ComputationGraph::isReachable(uint64_t srcID, uint32_t srcEpoch,
-                                   uint64_t dstID, uint32_t dstEpoch) {
-    if (srcID == dstID) {
-        return true;
-    }
-    Node* dstNode = nodeMap.get(dstID);
-    bool result = false;
-    queue<Node*> q;
-    q.push(dstNode);
-    while (!q.empty()) {
-        Node* next = q.front();
-        q.pop();
-        uint64_t cacheKey = generateCacheKey(srcID, next->id);
-        uint32_t cacheEpoch = cacheMap.get(cacheKey);
-        if (cacheEpoch >= srcEpoch) {
-            result = true;
-            break;
-        } else {
-            Dep* search = next->incomingEdges.get(srcID);
-            if (search && search->epoch >= srcEpoch) {
-                result = true;
-                break;
-            }
-            if (next->parent && next->parent->id == srcID &&
-                next->parent->parentEpoch >= srcEpoch) {
-                result = true;
-                break;
-            }
-            if (next->parent && next->parent->id != srcID) {
-                q.push(next->parent);
-            }
-            for (auto it = next->incomingEdges.begin(),
-                      ie = next->incomingEdges.end();
-                 it != ie; ++it) {
-                Node* ancestor = (*it).second->src;
-                if (ancestor->id == srcID) {
-                    continue;
-                }
-                while (ancestor->type == Node::EVENT &&
-                       ancestor->incomingEdges.getSize() == 1) {
-                    auto it = ancestor->incomingEdges.begin();
-                    ancestor = (*it).second->src;
-                }
-                q.push(ancestor);
-            }
-        }
-    }
-
-    if (result) {
-        updateCache(srcID, srcEpoch, dstID);
-    }
-    return result;
-}
-
-void ComputationGraph::updateCache(uint64_t srcID, uint32_t srcEpoch,
-                                   uint64_t dstID) {
-    uint64_t cacheKey = generateCacheKey(srcID, dstID);
-    if (cacheMap.get(cacheKey) < srcEpoch) {
-        cacheMap.put(cacheKey, srcEpoch);
-    }
-}
-
-inline void ComputationGraph::updateTaskFinalEpoch(uint64_t taskID,
-                                                   uint32_t epoch) {
-    epochMap.put(taskID, epoch);
-}
-
-#ifdef OUTPUT_CG
-void ComputationGraph::toDot(std::ostream& out) {
-#ifdef DEBUG
-    cout << "CG2Dot" << endl;
-#endif
-    cout << "node num = " << nodeMap.getSize() << endl;
-    // used to filter redundant nodes, since we may point multiple ID to a
-    // single node, for instance, we point an output event's ID to the associated
-    // task  std::set<Node*> accessedNode;
-    out << "digraph ComputationGraph {" << endl;
-    for (auto ci = nodeMap.begin(), ce = nodeMap.end(); ci != ce; ++ci) {
-        Node* node = (*ci).second;
-        // if (accessedNode.find(node) == accessedNode.end()) {
-        // accessedNode.insert(node);
-        //} else {
-        // continue;
-        //}
-        string nodeColor = nodeColorSchemes.find(node->type)->second.toString();
-        if (node->type == Node::TASK) {
-            uint32_t finalEpoch = epochMap.get(node->id);
-            for (uint32_t i = START_EPOCH + 1; i <= finalEpoch; i++) {
-                out << '\"' << node->id << "#" << i << '\"' << nodeColor << ";"
-                    << endl;
-            }
-        } else {
-            out << '\"' << node->id << '\"' << nodeColor << ";" << endl;
-        }
-    }
-
-    // accessedNode.clear();
-    for (auto ci = nodeMap.begin(), ce = nodeMap.end(); ci != ce; ++ci) {
-        Node* node = (*ci).second;
-        // if (accessedNode.find(node) == accessedNode.end()) {
-        // accessedNode.insert(node);
-        //} else {
-        // continue;
-        //}
-        
-        if (node->type == Node::TASK) {
-            if (node->parent) {
-                outputLink(out, node->parent, node->parentEpoch, node,
-                           START_EPOCH + 1, Node::SPAWN);
-            }
-            for (auto di = node->incomingEdges.begin(),
-                      de = node->incomingEdges.end();
-                 di != de; ++di) {
-                Dep* dep = (*di).second;
-                outputLink(out, dep->src,
-                           (dep->epoch == END_EPOCH ? epochMap.get(dep->src->id)
-                                                  : dep->epoch),
-                           node, START_EPOCH + 1, Node::JOIN);
-            }
-            uint32_t finalEpoch = epochMap.get(node->id);
-            for (uint32_t i = START_EPOCH + 1; i < finalEpoch; i++) {
-                outputLink(out, node, i, node, i + 1, Node::CONTINUE);
-            }
-        } else {
-            for (auto di = node->incomingEdges.begin(),
-                      de = node->incomingEdges.end();
-                 di != de; ++di) {
-                Dep* dep = (*di).second;
-                outputLink(out, dep->src,
-                           (dep->epoch == END_EPOCH ? epochMap.get(dep->src->id)
-                                                  : dep->epoch),
-                           node, START_EPOCH + 1, Node::JOIN);
-            }
-        }
-    }
-    out << "}";
-}
-
-void ComputationGraph::outputLink(ostream& out, Node* n1, u16 epoch1, Node* n2,
-                                  u16 epoch2, Node::EdgeType edgeType) {
-    out << '\"' << n1->id;
-    if (n1->type == Node::TASK) {
-        out << '#' << epoch1;
-    }
-    out << '\"';
-    out << " -> ";
-    out << '\"' << n2->id;
-    if (n2->type == Node::TASK) {
-        out << '#' << epoch2;
-    }
-    out << '\"';
-    out << ' ' << edgeColorSchemes.find(edgeType)->second.toString();
-    out << ';' << endl;
-}
-#endif
-
-ComputationGraph computationGraph(10000);
 
 void preEdt(THREADID tid, ocrGuid_t edtGuid, u32 paramc, u64* paramv, u32 depc,
             ocrEdtDep_t* depv, u64* dbSizev) {
@@ -779,55 +447,55 @@ void overload(IMG img, void* v) {
             PROTO_Free(proto_notifyEventSatisfy);
         }
 
-            // replace notifyShutdown
-            // rtn = RTN_FindByName(img, "notifyShutdown");
-            // if (RTN_Valid(rtn)) {
-            //#ifdef DEBUG
-            // *out << "replace notifyShutdown" << endl;
-            //#endif
-            // PROTO proto_notifyShutdown =
-            // PROTO_Allocate(PIN_PARG(void), CALLINGSTD_DEFAULT,
-            //"notifyShutdown", PIN_PARG_END());
-            // RTN_ReplaceSignature(rtn, AFUNPTR(fini), IARG_PROTOTYPE,
-            // proto_notifyShutdown, IARG_END);
-            // PROTO_Free(proto_notifyShutdown);
-            //}
+        // replace notifyShutdown
+        // rtn = RTN_FindByName(img, "notifyShutdown");
+        // if (RTN_Valid(rtn)) {
+        //#ifdef DEBUG
+        // *out << "replace notifyShutdown" << endl;
+        //#endif
+        // PROTO proto_notifyShutdown =
+        // PROTO_Allocate(PIN_PARG(void), CALLINGSTD_DEFAULT,
+        //"notifyShutdown", PIN_PARG_END());
+        // RTN_ReplaceSignature(rtn, AFUNPTR(fini), IARG_PROTOTYPE,
+        // proto_notifyShutdown, IARG_END);
+        // PROTO_Free(proto_notifyShutdown);
+        //}
 
-            // replace notifyDBDestroy
-            // rtn = RTN_FindByName(img, "notifyDbDestroy");
-            // if (RTN_Valid(rtn)) {
-            //#ifdef DEBUG
-            // *out << "replace notifyDbDestroy" << endl;
-            //#endif
-            // PROTO proto_notifyDbDestroy = PROTO_Allocate(
-            // PIN_PARG(void), CALLINGSTD_DEFAULT, "notifyDbDestroy",
-            // PIN_PARG_AGGREGATE(ocrGuid_t), PIN_PARG_END());
-            // RTN_ReplaceSignature(rtn, AFUNPTR(afterDbDestroy),
-            // IARG_PROTOTYPE, proto_notifyDbDestroy,
-            // IARG_FUNCARG_ENTRYPOINT_VALUE, 0, IARG_END);
-            // PROTO_Free(proto_notifyDbDestroy);
-            //}
+        // replace notifyDBDestroy
+        // rtn = RTN_FindByName(img, "notifyDbDestroy");
+        // if (RTN_Valid(rtn)) {
+        //#ifdef DEBUG
+        // *out << "replace notifyDbDestroy" << endl;
+        //#endif
+        // PROTO proto_notifyDbDestroy = PROTO_Allocate(
+        // PIN_PARG(void), CALLINGSTD_DEFAULT, "notifyDbDestroy",
+        // PIN_PARG_AGGREGATE(ocrGuid_t), PIN_PARG_END());
+        // RTN_ReplaceSignature(rtn, AFUNPTR(afterDbDestroy),
+        // IARG_PROTOTYPE, proto_notifyDbDestroy,
+        // IARG_FUNCARG_ENTRYPOINT_VALUE, 0, IARG_END);
+        // PROTO_Free(proto_notifyDbDestroy);
+        //}
 
-            // replace notifyEventPropagate
-            // rtn = RTN_FindByName(img, "notifyEventPropagate");
-            // if (RTN_Valid(rtn)) {
-            //#ifdef DEBUG
-            //*out << "replace notifyEventPropagate" << endl;
-            //#endif
-            // PROTO proto_notifyEventPropagate = PROTO_Allocate(
-            // PIN_PARG(void), CALLINGSTD_DEFAULT, "notifyEventPropagate",
-            // PIN_PARG_AGGREGATE(ocrGuid_t), PIN_PARG_END());
-            // RTN_ReplaceSignature(rtn, AFUNPTR(afterEventPropagate),
-            // IARG_PROTOTYPE, proto_notifyEventPropagate,
-            // IARG_FUNCARG_ENTRYPOINT_VALUE, 0, IARG_END);
-            // PROTO_Free(proto_notifyEventPropagate);
-            //}
+        // replace notifyEventPropagate
+        // rtn = RTN_FindByName(img, "notifyEventPropagate");
+        // if (RTN_Valid(rtn)) {
+        //#ifdef DEBUG
+        //*out << "replace notifyEventPropagate" << endl;
+        //#endif
+        // PROTO proto_notifyEventPropagate = PROTO_Allocate(
+        // PIN_PARG(void), CALLINGSTD_DEFAULT, "notifyEventPropagate",
+        // PIN_PARG_AGGREGATE(ocrGuid_t), PIN_PARG_END());
+        // RTN_ReplaceSignature(rtn, AFUNPTR(afterEventPropagate),
+        // IARG_PROTOTYPE, proto_notifyEventPropagate,
+        // IARG_FUNCARG_ENTRYPOINT_VALUE, 0, IARG_END);
+        // PROTO_Free(proto_notifyEventPropagate);
+        //}
 
         // replace notifyEdtTerminate
         rtn = RTN_FindByName(img, "notifyEdtTerminate");
         if (RTN_Valid(rtn)) {
 #ifdef DEBUG
-            *out << "replace notifyEdtTerminate";
+            *out << "replace notifyEdtTerminate" << endl;
 #endif
             PROTO proto_notifyEdtTerminate = PROTO_Allocate(
                 PIN_PARG(void), CALLINGSTD_DEFAULT, "notifyEdtTerminate",
@@ -839,6 +507,78 @@ void overload(IMG img, void* v) {
             PROTO_Free(proto_notifyEdtTerminate);
         }
     }
+}
+
+void recordMemRead(void* addr, uint32_t size, ADDRINT sp, ADDRINT ip) {
+#ifdef DEBUG
+    *out << "record memory read" << endl;
+#endif
+
+#ifdef DEBUG
+    *out << "record memory read end" << endl;
+#endif
+}
+
+void recordMemWrite(void* addr, uint32_t size, ADDRINT sp, ADDRINT ip) {
+#ifdef DEBUG
+    *out << "record memory write" << endl;
+#endif
+
+#ifdef DEBUG
+    *out << "record memory write" << endl;
+#endif
+}
+
+void instrumentInstruction(INS ins) {
+    if (isIgnorableIns(ins)) return;
+
+    if (INS_IsAtomicUpdate(ins)) return;
+
+    uint32_t memOperands = INS_MemoryOperandCount(ins);
+
+    // Iterate over each memory operand of the instruction.
+    for (uint32_t memOp = 0; memOp < memOperands; memOp++) {
+        if (INS_MemoryOperandIsRead(ins, memOp)) {
+            INS_InsertPredicatedCall(ins, IPOINT_BEFORE, (AFUNPTR)recordMemRead,
+                                     IARG_MEMORYOP_EA, memOp,
+                                     IARG_MEMORYREAD_SIZE, IARG_REG_VALUE,
+                                     REG_STACK_PTR, IARG_INST_PTR, IARG_END);
+        }
+        // Note that in some architectures a single memory operand can be
+        // both read and written (for instance incl (%eax) on IA-32)
+        // In that case we instrument it once for read and once for write.
+        if (INS_MemoryOperandIsWritten(ins, memOp)) {
+            INS_InsertPredicatedCall(
+                ins, IPOINT_BEFORE, (AFUNPTR)recordMemWrite, IARG_MEMORYOP_EA,
+                memOp, IARG_MEMORYWRITE_SIZE, IARG_REG_VALUE, REG_STACK_PTR,
+                IARG_INST_PTR, IARG_END);
+        }
+    }
+}
+
+void instrumentRoutine(RTN rtn) {
+    RTN_Open(rtn);
+    for (INS ins = RTN_InsHead(rtn); INS_Valid(ins); ins = INS_Next(ins)) {
+        instrumentInstruction(ins);
+    }
+    RTN_Close(rtn);
+}
+
+void instrumentImage(IMG img, void* v) {
+#ifdef DEBUG
+    cout << "instrument image\n";
+#endif
+    if (isUserCodeImg(img)) {
+        for (SEC sec = IMG_SecHead(img); SEC_Valid(sec); sec = SEC_Next(sec)) {
+            for (RTN rtn = SEC_RtnHead(sec); RTN_Valid(rtn);
+                 rtn = RTN_Next(rtn)) {
+                instrumentRoutine(rtn);
+            }
+        }
+    }
+#ifdef DEBUG
+    cout << "instrument image finish\n";
+#endif
 }
 
 int usage() {
@@ -907,9 +647,9 @@ int main(int argc, char* argv[]) {
     PIN_AddThreadFiniFunction(threadFini, NULL);
     PIN_AddFiniFunction(fini, 0);
     IMG_AddInstrumentFunction(overload, 0);
-    //#ifdef INSTRUMENT
-    // IMG_AddInstrumentFunction(instrumentImage, 0);
-    //#endif
+#ifdef INSTRUMENT
+    IMG_AddInstrumentFunction(instrumentImage, 0);
+#endif
 
 #ifdef MEASURE_TIME
     program_start = clock();

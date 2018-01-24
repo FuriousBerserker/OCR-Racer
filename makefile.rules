@@ -17,7 +17,7 @@
 # This defines tests which run tools of the same name.  This is simply for convenience to avoid
 # defining the test name twice (once in TOOL_ROOTS and again in TEST_ROOTS).
 # Tests defined here should not be defined in TOOL_ROOTS and TEST_ROOTS.
-TEST_TOOL_ROOTS := OCR-Racer
+TEST_TOOL_ROOTS := OCR-Racer 
 
 # This defines the tests to be run that were not already defined in TEST_TOOL_ROOTS.
 TEST_ROOTS :=
@@ -38,8 +38,7 @@ SA_TOOL_ROOTS :=
 APP_ROOTS :=
 
 # This defines any additional object files that need to be compiled.
-OBJECT_ROOTS :=
-
+OBJECT_ROOTS := 
 # This defines any additional dlls (shared objects), other than the pintools, that need to be compiled.
 DLL_ROOTS :=
 
@@ -52,7 +51,14 @@ LIB_ROOTS :=
 # TEST_TOOL_ROOTS and TEST_ROOTS excluding only unstable tests.
 SANITY_SUBSET := $(TEST_TOOL_ROOTS) $(TEST_ROOTS)
 
-TOOL_CXXFLAGS += -I /home/berserker/Repository/ConcurrentDataStructure/inc -I inc 
+#TOOL_CXXFLAGS += -Wl,-dynamic-list,symbol-list -I /home/berserker/Repository/ConcurrentDataStructure/inc -I inc -I ./ 
+TOOL_CXXFLAGS +=  -I /home/berserker/Repository/ConcurrentDataStructure/inc -I inc -I ./ 
+TOOL_CXXFLAGS += -DOUTPUT_CG
+TOOL_CXXFLAGS += -DDEBUG
+TOOL_CXXFLAGS += -DMEASURE_TIME
+#TOOL_LDFLAGS += -rdynamic
+#TOOL_CXXFLAGS += -DINSTRUMENT
+#TOOL_CXXFLAGS += -DDETECT_RACE
 ##############################################################
 #
 # Test recipes
@@ -72,3 +78,6 @@ TOOL_CXXFLAGS += -I /home/berserker/Repository/ConcurrentDataStructure/inc -I in
 
 # This section contains the build rules for all binaries that have special build rules.
 # See makefile.default.rules for the default build rules.
+
+$(OBJDIR)OCR-Racer$(PINTOOL_SUFFIX): $(OBJDIR)OCR-Racer$(OBJ_SUFFIX) $(OBJDIR)computation_graph$(OBJ_SUFFIX) $(OBJDIR)ocr_race_util$(OBJ_SUFFIX)
+	$(LINKER) $(TOOL_LDFLAGS) $(LINK_EXE)$@ $^ $(TOOL_LPATHS) $(TOOL_LIBS)
