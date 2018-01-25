@@ -52,7 +52,7 @@ LIB_ROOTS :=
 # TEST_TOOL_ROOTS and TEST_ROOTS excluding only unstable tests.
 SANITY_SUBSET := $(TEST_TOOL_ROOTS) $(TEST_ROOTS)
 
-TOOL_CXXFLAGS += -I /home/berserker/Repository/ConcurrentDataStructure/inc -I inc 
+TOOL_CXXFLAGS += -I /home/berserker/Repository/ConcurrentDataStructure/inc -I inc -Wno-aligned-new 
 ##############################################################
 #
 # Test recipes

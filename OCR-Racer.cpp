@@ -26,11 +26,10 @@
 #define INSTRUMENT
 #define DETECT_RACE
 #define MEASURE_TIME
-#define OUTPUT_CG
+//#define OUTPUT_CG
 
 class Node;
 class Task;
-class DataBlock;
 class Event;
 class ComputationMap;
 
@@ -64,7 +63,6 @@ std::ostream* err = &cerr;
 // std::ofstream logFile, errorFile;
 // std::ostream *out = &logFile;
 // std::ostream *err = &errorFile;
-
 
 ////////////////////////////////////////////////////////////////////////////////
 //                            Utility Function                               //
@@ -252,26 +250,6 @@ class ComputationGraph {
     void outputLink(std::ostream& out, Node* n1, uint32_t epoch1, Node* n2,
                     uint32_t epoch2, Node::EdgeType edgeType);
 #endif
-};
-
-class ThreadLocalStore {
-   public:
-    uint64_t taskID;
-    uint32_t taskEpoch;
-    void initialize(uint64_t taskID) {
-        this->taskID = taskID;
-        this->taskEpoch = START_EPOCH;
-    }
-    void increaseEpoch() { this->taskEpoch++; }
-    uint32_t getEpoch() { return this->taskEpoch; }
-    // vector<DBPage*> acquiredDB;
-    // void initializeAcquiredDB(u32 dpec, ocrEdtDep_t* depv);
-    // void insertDB(ocrGuid_t& guid);
-    // DBPage* getDB(uintptr_t addr);
-    // void removeDB(DBPage* dbPage);
-
-    // private:
-    // bool searchDB(uintptr_t addr, DBPage** ptr, u64* offset);
 };
 
 Node::Node(uint64_t id, Type type, Task* parent, uint32_t parentEpoch)
@@ -490,13 +468,266 @@ ComputationGraph computationGraph(10000);
 //                                Shadow Memory                              //
 ///////////////////////////////////////////////////////////////////////////////
 
+class AccessRecord {
+   public:
+    uint64_t taskID;
+    uint32_t epoch;
+    int32_t ref;
+    ADDRINT ip;
+
+   public:
+    AccessRecord() : AccessRecord(NULL_ID, START_EPOCH, 0) {}
+    AccessRecord(uint64_t taskID, uint32_t epoch, ADDRINT ip)
+        : taskID(taskID), epoch(epoch), ref(0), ip(ip) {}
+    AccessRecord& operator=(const AccessRecord& other) {
+        this->taskID = other.taskID;
+        this->epoch = other.epoch;
+        this->ip = other.ip;
+        this->ref = 0;
+        return *this;
+    }
+    bool isEmpty() { return taskID == NULL_ID; }
+    void increaseRef() { ATOMIC::OPS::Increment(&ref, (int32_t)1); }
+    void decreaseRef() {
+        int oldVal = ATOMIC::OPS::Increment(&ref, (int32_t)-1);
+        if (oldVal == 1) {
+            delete this;
+        }
+    }
+    virtual ~AccessRecord() {}
+};
+
+class ByteSM {
+   private:
+    AccessRecord* write;
+    std::unordered_map<uint64_t, AccessRecord*> reads;
+    PIN_RWMUTEX rwLock;
+
+   public:
+    ByteSM() : write(nullptr), reads() {
+        if (!PIN_RWMutexInit(&rwLock)) {
+            cerr << "Fail to initialize RW lock" << endl;
+            PIN_ExitProcess(1);
+        }
+    }
+    virtual ~ByteSM() {
+        write->decreaseRef();
+        for (auto it = reads.begin(), ie = reads.end(); it != ie; it++) {
+            it->second->decreaseRef();
+        }
+        PIN_RWMutexFini(&rwLock);
+    }
+    bool hasRead() { return !reads.empty(); }
+    bool hasWrite() { return write != nullptr; }
+    void updateWrite(AccessRecord* other) {
+        PIN_RWMutexWriteLock(&rwLock);
+        if (this->write) {
+            this->write->decreaseRef();
+        }
+        this->write = other;
+        other->increaseRef();
+        for (auto it = reads.begin(), ie = reads.end(); it != ie; it++) {
+            it->second->decreaseRef();
+        }
+        this->reads.clear();
+        PIN_RWMutexUnlock(&rwLock);
+    }
+    void updateRead(AccessRecord* other) {
+        PIN_RWMutexWriteLock(&rwLock);
+        auto it = reads.find(other->taskID);
+        if (it == reads.end()) {
+            other->increaseRef();
+            reads.insert(std::make_pair(other->taskID, other));
+        } else if (it->second->epoch < other->epoch) {
+            it->second->decreaseRef();
+            other->increaseRef();
+            it->second = other;
+        }
+        PIN_RWMutexUnlock(&rwLock);
+    }
+    std::unordered_map<uint64_t, AccessRecord*>& getReads() {
+        return reads;
+    }
+    AccessRecord* getWrite() {
+        return write;
+    }
+    void readLock() {
+        PIN_RWMutexReadLock(&rwLock);
+    }
+    void readUnlock() { 
+        PIN_RWMutexUnlock(&rwLock);
+    }
+    friend void recordMemRead(THREADID tid, void* addr, uint32_t size, ADDRINT sp, ADDRINT ip);
+    friend void recordMemWrite(THREADID tid, void* addr, uint32_t size, ADDRINT sp, ADDRINT ip); 
+};
+
+class DataBlockSM {
+   private:
+    uintptr_t startAddress;
+    uint64_t length;
+    ByteSM* byteArray;
+
+   public:
+    DataBlockSM(uintptr_t startAddress, uint64_t length)
+        : startAddress(startAddress), length(length) {
+        byteArray = new ByteSM[length]();    
+    }
+    virtual ~DataBlockSM() {}
+    void update(uintptr_t address, unsigned size, AccessRecord* ar,
+                bool isRead) {
+        //cout << (isRead ? "read" : "write") << endl;
+        uint64_t offset = address - startAddress;
+        assert(offset >= 0 && offset < length);
+        if (isRead) {
+            for (unsigned i = 0; i < size; i++) {
+                byteArray[offset + i].updateRead(ar);
+            }
+        } else {
+            for (unsigned i = 0; i < size; i++) {
+                byteArray[offset + i].updateWrite(ar);
+            }
+        }
+    }
+
+    friend class ThreadLocalStore;
+    friend void recordMemRead(THREADID tid, void* addr, uint32_t size, ADDRINT sp, ADDRINT ip);
+    friend void recordMemWrite(THREADID tid, void* addr, uint32_t size, ADDRINT sp, ADDRINT ip); 
+};
+
+class ShadowMemory {
+   private:
+    ConcurrentHashMap<uint64_t, DataBlockSM*, nullptr, IdentityHash<uint64_t> >
+        dbMap;
+
+   public:
+    ShadowMemory(uint64_t capacity) : dbMap(capacity) {}
+    virtual ~ShadowMemory() {}
+    void insertDB(uint64_t id, DataBlockSM* db) { dbMap.put(id, db); }
+    DataBlockSM* getDB(uint64_t id) { return dbMap.get(id); }
+};
+
+ShadowMemory sm(10000);
+
+////////////////////////////////////////////////////////////////////////////////
+//                            Thread Local Storage                           //
+///////////////////////////////////////////////////////////////////////////////
+
+class ThreadLocalStore {
+   private:
+    uint64_t taskID;
+    uint32_t taskEpoch;
+    std::vector<DataBlockSM*> acquiredDB;
+
+   public:
+    void initialize(uint64_t taskID) {
+        this->taskID = taskID;
+        this->taskEpoch = START_EPOCH;
+    }
+    void increaseEpoch() { this->taskEpoch++; }
+    uint32_t getEpoch() { return this->taskEpoch; }
+    void initializeAcquiredDB(uint32_t dpec, ocrEdtDep_t* depv);
+    void insertDB(DataBlockSM* db);
+    DataBlockSM* getDB(uintptr_t addr);
+    void removeDB(DataBlockSM* db);
+
+   private:
+    bool searchDB(uintptr_t addr, DataBlockSM** ptr, int* offset);
+
+    friend void recordMemRead(THREADID tid, void* addr, uint32_t size, ADDRINT sp, ADDRINT ip);
+    friend void recordMemWrite(THREADID tid, void* addr, uint32_t size, ADDRINT sp, ADDRINT ip); 
+};
+
+void ThreadLocalStore::initializeAcquiredDB(uint32_t depc, ocrEdtDep_t* depv) {
+    acquiredDB.clear();
+    acquiredDB.reserve(2 * depc);
+    for (u32 i = 0; i < depc; i++) {
+        if (depv[i].ptr) {
+            DataBlockSM* db = sm.getDB(depv[i].guid.guid);
+            assert(db != nullptr);
+            assert(db->startAddress == (uintptr_t)depv[i].ptr);
+            acquiredDB.push_back(db);
+        }
+    }
+    sort(acquiredDB.begin(), acquiredDB.end(),
+         [](DataBlockSM* a, DataBlockSM* b) {
+             return a->startAddress < b->startAddress;
+         });
+}
+
+void ThreadLocalStore::insertDB(DataBlockSM* db) {
+    int offset;
+    bool isContain = searchDB(db->startAddress, nullptr, &offset);
+    assert(!isContain);
+    acquiredDB.insert(acquiredDB.begin() + offset, db);
+}
+
+DataBlockSM* ThreadLocalStore::getDB(uintptr_t addr) {
+    DataBlockSM* db;
+    searchDB(addr, &db, nullptr);
+    return db;
+}
+
+void ThreadLocalStore::removeDB(DataBlockSM* db) {
+    int offset;
+    bool isContain = searchDB(db->startAddress, nullptr, &offset);
+    //assert(isContain);
+    if (isContain) {
+        acquiredDB.erase(acquiredDB.begin() + offset);
+    }
+}
+
+bool ThreadLocalStore::searchDB(uintptr_t addr, DataBlockSM** ptr,
+                                int* offset) {
+#ifdef DEBUG
+    *out << "search DB" << std::endl;
+#endif
+    int start = 0, end = acquiredDB.size() - 1;
+    bool isFind = false;
+    while (start <= end) {
+        int next = (start + end) / 2;
+        DataBlockSM* db = acquiredDB[next];
+        if (addr >= db->startAddress) {
+            if (addr < db->startAddress + db->length) {
+                // address is inside current db
+                isFind = true;
+                if (ptr) {
+                    *ptr = db;
+                }
+                if (offset) {
+                    *offset = next;
+                }
+                break;
+            } else {
+                // addess is after current db
+                start = next + 1;
+            }
+        } else {
+            // address is before current db
+            end = next - 1;
+        }
+    }
+
+    if (!isFind) {
+        if (ptr) {
+            *ptr = nullptr;
+        }
+        if (offset) {
+            *offset = start;
+        }
+    }
+
+#ifdef DEBUG
+    *out << "search DB end " << (isFind ? "found" : "unfound") << std::endl;
+#endif
+    return isFind;
+}
 
 ////////////////////////////////////////////////////////////////////////////////
 //                  API Call & Runtime Event Instrumentation                 //
 ///////////////////////////////////////////////////////////////////////////////
 
-void preEdt(THREADID tid, ocrGuid_t edtGuid, u32 paramc, u64* paramv, u32 depc,
-            ocrEdtDep_t* depv, u64* dbSizev) {
+void preEdt(THREADID tid, ocrGuid_t edtGuid, uint32_t paramc, uint64_t* paramv,
+            uint32_t depc, ocrEdtDep_t* depv, uint64_t* dbSizev) {
 #ifdef DEBUG
     *out << "preEdt" << endl;
 #endif
@@ -512,8 +743,9 @@ void preEdt(THREADID tid, ocrGuid_t edtGuid, u32 paramc, u64* paramv, u32 depc,
 
 // depv is always NULL
 void afterEdtCreate(THREADID tid, ocrGuid_t guid, ocrGuid_t templateGuid,
-                    u32 paramc, u64* paramv, u32 depc, ocrGuid_t* depv,
-                    u16 properties, ocrGuid_t outputEvent, ocrGuid_t parent) {
+                    uint32_t paramc, uint64_t* paramv, uint32_t depc,
+                    ocrGuid_t* depv, uint16_t properties, ocrGuid_t outputEvent,
+                    ocrGuid_t parent) {
 #ifdef DEBUG
     *out << "afterEdtCreate" << endl;
 #endif
@@ -553,8 +785,24 @@ void afterEdtCreate(THREADID tid, ocrGuid_t guid, ocrGuid_t templateGuid,
 #endif
 }
 
+void afterDbCreate(THREADID tid, ocrGuid_t guid, void* addr, uint64_t len,
+                   uint16_t flags, ocrInDbAllocator_t allocator) {
+#ifdef DEBUG
+    *out << "afterDbCreate" << endl;
+#endif
+    DataBlockSM* newDB = new DataBlockSM((uintptr_t)addr, len);
+    sm.insertDB(guid.guid, newDB);
+    // new created DB is acquired by current EDT instantly
+    ThreadLocalStore* tls =
+        static_cast<ThreadLocalStore*>(PIN_GetThreadData(tls_key, tid));
+    tls->insertDB(newDB);
+#ifdef DEBUG
+    cout << "afterDbCreate finish" << endl;
+#endif
+}
+
 void afterEventCreate(ocrGuid_t guid, ocrEventTypes_t eventType,
-                      u16 properties) {
+                      uint16_t properties) {
 #ifdef DEBUG
     *out << "afterEventCreate" << endl;
 #endif
@@ -567,7 +815,7 @@ void afterEventCreate(ocrGuid_t guid, ocrEventTypes_t eventType,
 #endif
 }
 
-void afterAddDependence(ocrGuid_t source, ocrGuid_t destination, u32 slot,
+void afterAddDependence(ocrGuid_t source, ocrGuid_t destination, uint32_t slot,
                         ocrDbAccessMode_t mode) {
 #ifdef DEBUG
     *out << "afterAddDependence" << endl;
@@ -592,7 +840,7 @@ void afterAddDependence(ocrGuid_t source, ocrGuid_t destination, u32 slot,
 }
 
 void afterEventSatisfy(THREADID tid, ocrGuid_t edtGuid, ocrGuid_t eventGuid,
-                       ocrGuid_t dataGuid, u32 slot) {
+                       ocrGuid_t dataGuid, uint32_t slot) {
 #ifdef DEBUG
     cout << "afterEventSatisfy" << endl;
 #endif
@@ -638,6 +886,22 @@ void afterEdtTerminate(THREADID tid, ocrGuid_t edtGuid) {
 #endif
 }
 
+void afterDbDestroy(THREADID tid, ocrGuid_t dbGuid) {
+#ifdef DEBUG
+    *out << "afterDbDestroy" << endl;
+#endif
+    DataBlockSM* db = sm.getDB(dbGuid.guid);
+    if (db) {
+        ThreadLocalStore* tls =
+            static_cast<ThreadLocalStore*>(PIN_GetThreadData(tls_key, tid));
+        tls->removeDB(db);
+        //delete db;
+    }
+#ifdef DEBUG
+    *out << "afterDbDestroy finish" << endl;
+#endif
+}
+
 void threadStart(THREADID tid, CONTEXT* ctxt, int32_t flags, void* v) {
     ThreadLocalStore* tls = new ThreadLocalStore();
     if (PIN_SetThreadData(tls_key, tls, tid) == FALSE) {
@@ -676,7 +940,6 @@ void fini(int32_t code, void* v) {
     // logFile.close();
 }
 
-
 void overload(IMG img, void* v) {
 #ifdef DEBUG
     *out << "img: " << IMG_Name(img) << endl;
@@ -708,9 +971,9 @@ void overload(IMG img, void* v) {
 #endif
             PROTO proto_notifyEdtStart = PROTO_Allocate(
                 PIN_PARG(void), CALLINGSTD_DEFAULT, "notifyEdtStart",
-                PIN_PARG_AGGREGATE(ocrGuid_t), PIN_PARG(u32), PIN_PARG(u64*),
-                PIN_PARG(u32), PIN_PARG(ocrEdtDep_t*), PIN_PARG(u64*),
-                PIN_PARG_END());
+                PIN_PARG_AGGREGATE(ocrGuid_t), PIN_PARG(uint32_t),
+                PIN_PARG(uint64_t*), PIN_PARG(uint32_t), PIN_PARG(ocrEdtDep_t*),
+                PIN_PARG(uint64_t*), PIN_PARG_END());
             RTN_ReplaceSignature(
                 rtn, AFUNPTR(preEdt), IARG_PROTOTYPE, proto_notifyEdtStart,
                 IARG_THREAD_ID, IARG_FUNCARG_ENTRYPOINT_VALUE, 0,
@@ -729,8 +992,8 @@ void overload(IMG img, void* v) {
             PROTO proto_notifyEdtCreate = PROTO_Allocate(
                 PIN_PARG(void), CALLINGSTD_DEFAULT, "notifyEdtCreate",
                 PIN_PARG_AGGREGATE(ocrGuid_t), PIN_PARG_AGGREGATE(ocrGuid_t),
-                PIN_PARG(u32), PIN_PARG(u64*), PIN_PARG(u32),
-                PIN_PARG(ocrGuid_t*), PIN_PARG(u16),
+                PIN_PARG(uint32_t), PIN_PARG(uint64_t*), PIN_PARG(uint32_t),
+                PIN_PARG(ocrGuid_t*), PIN_PARG(uint16_t),
                 PIN_PARG_AGGREGATE(ocrGuid_t), PIN_PARG_AGGREGATE(ocrGuid_t),
                 PIN_PARG_END());
             RTN_ReplaceSignature(
@@ -746,24 +1009,25 @@ void overload(IMG img, void* v) {
         }
 
         // replace notidyDbCreate
-        // rtn = RTN_FindByName(img, "notifyDbCreate");
-        // if (RTN_Valid(rtn)) {
-        //#ifdef DEBUG
-        //*out << "replace notifyDbCreate" << endl;
-        //#endif
-        // PROTO proto_notifyDbCreate = PROTO_Allocate(
-        // PIN_PARG(void), CALLINGSTD_DEFAULT, "notifyDbCreate",
-        // PIN_PARG_AGGREGATE(ocrGuid_t), PIN_PARG(void*), PIN_PARG(u64),
-        // PIN_PARG(u16), PIN_PARG_ENUM(ocrInDbAllocator_t),
-        // PIN_PARG_END());
-        // RTN_ReplaceSignature(
-        // rtn, AFUNPTR(afterDbCreate), IARG_PROTOTYPE,
-        // proto_notifyDbCreate, IARG_FUNCARG_ENTRYPOINT_VALUE, 0,
-        // IARG_FUNCARG_ENTRYPOINT_VALUE, 1, IARG_FUNCARG_ENTRYPOINT_VALUE,
-        // 2, IARG_FUNCARG_ENTRYPOINT_VALUE, 3,
-        // IARG_FUNCARG_ENTRYPOINT_VALUE, 4, IARG_END);
-        // PROTO_Free(proto_notifyDbCreate);
-        //}
+        rtn = RTN_FindByName(img, "notifyDbCreate");
+        if (RTN_Valid(rtn)) {
+#ifdef DEBUG
+            *out << "replace notifyDbCreate" << endl;
+#endif
+            PROTO proto_notifyDbCreate = PROTO_Allocate(
+                PIN_PARG(void), CALLINGSTD_DEFAULT, "notifyDbCreate",
+                PIN_PARG_AGGREGATE(ocrGuid_t), PIN_PARG(void*),
+                PIN_PARG(uint64_t), PIN_PARG(uint16_t),
+                PIN_PARG_ENUM(ocrInDbAllocator_t), PIN_PARG_END());
+            RTN_ReplaceSignature(rtn, AFUNPTR(afterDbCreate), IARG_PROTOTYPE,
+                                 proto_notifyDbCreate, IARG_THREAD_ID,
+                                 IARG_FUNCARG_ENTRYPOINT_VALUE, 0,
+                                 IARG_FUNCARG_ENTRYPOINT_VALUE, 1,
+                                 IARG_FUNCARG_ENTRYPOINT_VALUE, 2,
+                                 IARG_FUNCARG_ENTRYPOINT_VALUE, 3,
+                                 IARG_FUNCARG_ENTRYPOINT_VALUE, 4, IARG_END);
+            PROTO_Free(proto_notifyDbCreate);
+        }
 
         // replace notifyEventCreate
         rtn = RTN_FindByName(img, "notifyEventCreate");
@@ -774,7 +1038,7 @@ void overload(IMG img, void* v) {
             PROTO proto_notifyEventCreate = PROTO_Allocate(
                 PIN_PARG(void), CALLINGSTD_DEFAULT, "notifyEventCreate",
                 PIN_PARG_AGGREGATE(ocrGuid_t), PIN_PARG_ENUM(ocrEventTypes_t),
-                PIN_PARG(u16), PIN_PARG_END());
+                PIN_PARG(uint16_t), PIN_PARG_END());
             RTN_ReplaceSignature(rtn, AFUNPTR(afterEventCreate), IARG_PROTOTYPE,
                                  proto_notifyEventCreate,
                                  IARG_FUNCARG_ENTRYPOINT_VALUE, 0,
@@ -792,7 +1056,7 @@ void overload(IMG img, void* v) {
             PROTO proto_notifyAddDependence = PROTO_Allocate(
                 PIN_PARG(void), CALLINGSTD_DEFAULT, "notifyAddDependence",
                 PIN_PARG_AGGREGATE(ocrGuid_t), PIN_PARG_AGGREGATE(ocrGuid_t),
-                PIN_PARG(u32), PIN_PARG_ENUM(ocrDbAccessMode_t),
+                PIN_PARG(uint32_t), PIN_PARG_ENUM(ocrDbAccessMode_t),
                 PIN_PARG_END());
             RTN_ReplaceSignature(
                 rtn, AFUNPTR(afterAddDependence), IARG_PROTOTYPE,
@@ -811,7 +1075,8 @@ void overload(IMG img, void* v) {
             PROTO proto_notifyEventSatisfy = PROTO_Allocate(
                 PIN_PARG(void), CALLINGSTD_DEFAULT, "notifyEventSatisfy",
                 PIN_PARG_AGGREGATE(ocrGuid_t), PIN_PARG_AGGREGATE(ocrGuid_t),
-                PIN_PARG_AGGREGATE(ocrGuid_t), PIN_PARG(u32), PIN_PARG_END());
+                PIN_PARG_AGGREGATE(ocrGuid_t), PIN_PARG(uint32_t),
+                PIN_PARG_END());
             RTN_ReplaceSignature(rtn, AFUNPTR(afterEventSatisfy),
                                  IARG_PROTOTYPE, proto_notifyEventSatisfy,
                                  IARG_THREAD_ID, IARG_FUNCARG_ENTRYPOINT_VALUE,
@@ -836,19 +1101,19 @@ void overload(IMG img, void* v) {
         //}
 
         // replace notifyDBDestroy
-        // rtn = RTN_FindByName(img, "notifyDbDestroy");
-        // if (RTN_Valid(rtn)) {
-        //#ifdef DEBUG
-        // *out << "replace notifyDbDestroy" << endl;
-        //#endif
-        // PROTO proto_notifyDbDestroy = PROTO_Allocate(
-        // PIN_PARG(void), CALLINGSTD_DEFAULT, "notifyDbDestroy",
-        // PIN_PARG_AGGREGATE(ocrGuid_t), PIN_PARG_END());
-        // RTN_ReplaceSignature(rtn, AFUNPTR(afterDbDestroy),
-        // IARG_PROTOTYPE, proto_notifyDbDestroy,
-        // IARG_FUNCARG_ENTRYPOINT_VALUE, 0, IARG_END);
-        // PROTO_Free(proto_notifyDbDestroy);
-        //}
+        rtn = RTN_FindByName(img, "notifyDbDestroy");
+        if (RTN_Valid(rtn)) {
+#ifdef DEBUG
+            *out << "replace notifyDbDestroy" << endl;
+#endif
+            PROTO proto_notifyDbDestroy = PROTO_Allocate(
+                PIN_PARG(void), CALLINGSTD_DEFAULT, "notifyDbDestroy",
+                PIN_PARG_AGGREGATE(ocrGuid_t), PIN_PARG_END());
+            RTN_ReplaceSignature(rtn, AFUNPTR(afterDbDestroy), IARG_PROTOTYPE,
+                                 proto_notifyDbDestroy, IARG_THREAD_ID,
+                                 IARG_FUNCARG_ENTRYPOINT_VALUE, 0, IARG_END);
+            PROTO_Free(proto_notifyDbDestroy);
+        }
 
         // replace notifyEventPropagate
         // rtn = RTN_FindByName(img, "notifyEventPropagate");
@@ -887,9 +1152,68 @@ void overload(IMG img, void* v) {
 //                Memory Operation Instrumentation                           //
 ///////////////////////////////////////////////////////////////////////////////
 
-void recordMemRead(void* addr, uint32_t size, ADDRINT sp, ADDRINT ip) {}
+void recordMemRead(THREADID tid, void* addr, uint32_t size, ADDRINT sp, ADDRINT ip) {
+    ThreadLocalStore* tls =
+            static_cast<ThreadLocalStore*>(PIN_GetThreadData(tls_key, tid));
+    DataBlockSM* db = tls->getDB((uintptr_t)addr);
+    std::unordered_map<uint64_t, AccessRecord*> previousOPs;
+    if (db) {
+        AccessRecord* ar = new AccessRecord(tls->taskID, tls->taskEpoch, ip);
+        db->update((uintptr_t)addr, size, ar, true);
+        uintptr_t offset = (uintptr_t)addr - db->startAddress;
+        for (uintptr_t i = 0; i < size; i++) {
+            ByteSM& byteSM = db->byteArray[offset + i];
+            byteSM.readLock();
+            if (byteSM.hasWrite()) {
+                AccessRecord* write = byteSM.getWrite();
+                auto it = previousOPs.find(write->taskID);
+                if (it == previousOPs.end()) {
+                    previousOPs.insert(std::make_pair(write->taskID, write));
+                } else if (write->epoch > it->second->epoch) {
+                    it->second = write;
+                }
+            }
+            byteSM.readUnlock();
+        }
+    }
+}
 
-void recordMemWrite(void* addr, uint32_t size, ADDRINT sp, ADDRINT ip) {}
+void recordMemWrite(THREADID tid, void* addr, uint32_t size, ADDRINT sp, ADDRINT ip) {
+    ThreadLocalStore* tls =
+            static_cast<ThreadLocalStore*>(PIN_GetThreadData(tls_key, tid));
+    DataBlockSM* db = tls->getDB((uintptr_t)addr);
+    std::unordered_map<uint64_t, AccessRecord*> previousOPs;
+    if (db) {
+        AccessRecord* ar = new AccessRecord(tls->taskID, tls->taskEpoch, ip);
+        db->update(uintptr_t(addr), size, ar, false);
+        uintptr_t offset = (uintptr_t)addr - db->startAddress;
+        for (uintptr_t i = 0; i < size; i++) {
+            ByteSM& byteSM = db->byteArray[offset + i];
+            byteSM.readLock();
+            if (byteSM.hasWrite()) {
+                AccessRecord* write = byteSM.getWrite();
+                auto it = previousOPs.find(write->taskID);
+                if (it == previousOPs.end()) {
+                    previousOPs.insert(std::make_pair(write->taskID, write));
+                } else if (write->epoch > it->second->epoch) {
+                    it->second = write;
+                }
+            }
+            if (byteSM.hasRead()) {
+                for (auto rt = byteSM.getReads().begin(), re = byteSM.getReads().end(); rt != re; ++rt) {
+                    AccessRecord* read = rt->second;
+                    auto it = previousOPs.find(read->taskID);
+                    if (it == previousOPs.end()) {
+                        previousOPs.insert(std::make_pair(read->taskID, read));
+                    } else if (read->epoch > it->second->epoch) {
+                        it->second = read;
+                    }
+                }    
+            }
+            byteSM.readUnlock();
+        }
+    }
+}
 
 void instrumentInstruction(INS ins) {
     if (isIgnorableIns(ins)) return;
@@ -902,7 +1226,7 @@ void instrumentInstruction(INS ins) {
     for (uint32_t memOp = 0; memOp < memOperands; memOp++) {
         if (INS_MemoryOperandIsRead(ins, memOp)) {
             INS_InsertPredicatedCall(ins, IPOINT_BEFORE, (AFUNPTR)recordMemRead,
-                                     IARG_MEMORYOP_EA, memOp,
+                                     IARG_THREAD_ID, IARG_MEMORYOP_EA, memOp,
                                      IARG_MEMORYREAD_SIZE, IARG_REG_VALUE,
                                      REG_STACK_PTR, IARG_INST_PTR, IARG_END);
         }
@@ -911,9 +1235,9 @@ void instrumentInstruction(INS ins) {
         // In that case we instrument it once for read and once for write.
         if (INS_MemoryOperandIsWritten(ins, memOp)) {
             INS_InsertPredicatedCall(
-                ins, IPOINT_BEFORE, (AFUNPTR)recordMemWrite, IARG_MEMORYOP_EA,
-                memOp, IARG_MEMORYWRITE_SIZE, IARG_REG_VALUE, REG_STACK_PTR,
-                IARG_INST_PTR, IARG_END);
+                ins, IPOINT_BEFORE, (AFUNPTR)recordMemWrite, IARG_THREAD_ID,
+                IARG_MEMORYOP_EA, memOp, IARG_MEMORYWRITE_SIZE, IARG_REG_VALUE,
+                REG_STACK_PTR, IARG_INST_PTR, IARG_END);
         }
     }
 }
@@ -942,7 +1266,6 @@ void instrumentImage(IMG img, void* v) {
     cout << "instrument image finish\n";
 #endif
 }
-
 
 int usage() {
     cout << "OCR-Racer is a graph traversal based data race detector for "
@@ -1010,9 +1333,9 @@ int main(int argc, char* argv[]) {
     PIN_AddThreadFiniFunction(threadFini, NULL);
     PIN_AddFiniFunction(fini, 0);
     IMG_AddInstrumentFunction(overload, 0);
-    //#ifdef INSTRUMENT
+    #ifdef INSTRUMENT
     IMG_AddInstrumentFunction(instrumentImage, 0);
-    //#endif
+    #endif
 
 #ifdef MEASURE_TIME
     program_start = clock();
