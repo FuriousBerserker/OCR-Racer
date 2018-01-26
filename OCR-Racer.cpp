@@ -13,6 +13,7 @@
 #include <map>
 #include <queue>
 #include <set>
+#include <sstream>
 #include <string>
 #include <unordered_map>
 #include "pin.H"
@@ -63,6 +64,7 @@ std::ostream* err = &cerr;
 // std::ofstream logFile, errorFile;
 // std::ostream *out = &logFile;
 // std::ostream *err = &errorFile;
+std::stringstream ss;
 
 ////////////////////////////////////////////////////////////////////////////////
 //                            Utility Function                               //
@@ -94,10 +96,31 @@ inline bool isEndWith(std::string& s1, std::string& s2) {
     }
 }
 
+/**
+ * Test whether s2 is the prefix of s1
+ */
+inline bool isStartWith(std::string& s1, std::string& s2) {
+    if (s1.size() < s2.size()) {
+        return false;
+    } else {
+        return !s1.compare(0, s2.size(), s2);
+    }
+}
+
 inline bool isOCRLibrary(IMG& img) {
     std::string ocrLibraryName = "libocr_x86.so";
     std::string imageName = IMG_Name(img);
     if (isEndWith(imageName, ocrLibraryName)) {
+        return true;
+    } else {
+        return false;
+    }
+}
+
+inline bool isOCRCall(RTN& rtn) {
+    std::string ocrCallPrefix = "ocr";
+    std::string rtnName = RTN_Name(rtn);
+    if (isStartWith(rtnName, ocrCallPrefix)) {
         return true;
     } else {
         return false;
@@ -135,9 +158,9 @@ bool isNullGuid(ocrGuid_t& guid) {
     }
 }
 
-////////////////////////////////////////////////////////////////////////////////
-//                            Computation Graph                              //
-///////////////////////////////////////////////////////////////////////////////
+    ////////////////////////////////////////////////////////////////////////////////
+    //                            Computation Graph //
+    ///////////////////////////////////////////////////////////////////////////////
 
 #ifdef OUTPUT_CG
 class ColorScheme {
@@ -374,13 +397,13 @@ inline void ComputationGraph::updateTaskFinalEpoch(uint64_t taskID,
 #ifdef OUTPUT_CG
 void ComputationGraph::toDot(std::ostream& out) {
 #ifdef DEBUG
-    cout << "CG2Dot" << endl;
+    cout << "CG2Dot" << std::endl;
 #endif
-    cout << "node num = " << nodeMap.getSize() << endl;
+    cout << "node num = " << nodeMap.getSize() << std::endl;
     // used to filter redundant nodes, since we may point multiple ID to a
     // single node, for instance, we point an output event's ID to the
     // associated task  std::set<Node*> accessedNode;
-    out << "digraph ComputationGraph {" << endl;
+    out << "digraph ComputationGraph {" << std::endl;
     for (auto ci = nodeMap.begin(), ce = nodeMap.end(); ci != ce; ++ci) {
         Node* node = (*ci).second;
         // if (accessedNode.find(node) == accessedNode.end()) {
@@ -394,10 +417,10 @@ void ComputationGraph::toDot(std::ostream& out) {
             uint32_t finalEpoch = epochMap.get(node->id);
             for (uint32_t i = START_EPOCH + 1; i <= finalEpoch; i++) {
                 out << '\"' << node->id << "#" << i << '\"' << nodeColor << ";"
-                    << endl;
+                    << std::endl;
             }
         } else {
-            out << '\"' << node->id << '\"' << nodeColor << ";" << endl;
+            out << '\"' << node->id << '\"' << nodeColor << ";" << std::endl;
         }
     }
 
@@ -458,7 +481,7 @@ void ComputationGraph::outputLink(std::ostream& out, Node* n1, uint32_t epoch1,
     }
     out << '\"';
     out << ' ' << edgeColorSchemes.find(edgeType)->second.toString();
-    out << ';' << endl;
+    out << ';' << std::endl;
 }
 #endif
 
@@ -494,6 +517,18 @@ class AccessRecord {
             delete this;
         }
     }
+
+    std::string getSourceInfo() {
+        int32_t column, line;
+        std::string file;
+        PIN_LockClient();
+        PIN_GetSourceLocation(ip, &column, &line, &file);
+        PIN_UnlockClient();
+        ss.str("");
+        ss << file << " " << line << " " << column;
+        return ss.str();
+    }
+
     virtual ~AccessRecord() {}
 };
 
@@ -506,7 +541,7 @@ class ByteSM {
    public:
     ByteSM() : write(nullptr), reads() {
         if (!PIN_RWMutexInit(&rwLock)) {
-            cerr << "Fail to initialize RW lock" << endl;
+            cerr << "Fail to initialize RW lock" << std::endl;
             PIN_ExitProcess(1);
         }
     }
@@ -545,20 +580,14 @@ class ByteSM {
         }
         PIN_RWMutexUnlock(&rwLock);
     }
-    std::unordered_map<uint64_t, AccessRecord*>& getReads() {
-        return reads;
-    }
-    AccessRecord* getWrite() {
-        return write;
-    }
-    void readLock() {
-        PIN_RWMutexReadLock(&rwLock);
-    }
-    void readUnlock() { 
-        PIN_RWMutexUnlock(&rwLock);
-    }
-    friend void recordMemRead(THREADID tid, void* addr, uint32_t size, ADDRINT sp, ADDRINT ip);
-    friend void recordMemWrite(THREADID tid, void* addr, uint32_t size, ADDRINT sp, ADDRINT ip); 
+    std::unordered_map<uint64_t, AccessRecord*>& getReads() { return reads; }
+    AccessRecord* getWrite() { return write; }
+    void readLock() { PIN_RWMutexReadLock(&rwLock); }
+    void readUnlock() { PIN_RWMutexUnlock(&rwLock); }
+    friend void recordMemRead(THREADID tid, void* addr, uint32_t size,
+                              ADDRINT sp, ADDRINT ip);
+    friend void recordMemWrite(THREADID tid, void* addr, uint32_t size,
+                               ADDRINT sp, ADDRINT ip);
 };
 
 class DataBlockSM {
@@ -570,12 +599,12 @@ class DataBlockSM {
    public:
     DataBlockSM(uintptr_t startAddress, uint64_t length)
         : startAddress(startAddress), length(length) {
-        byteArray = new ByteSM[length]();    
+        byteArray = new ByteSM[length]();
     }
     virtual ~DataBlockSM() {}
     void update(uintptr_t address, unsigned size, AccessRecord* ar,
                 bool isRead) {
-        //cout << (isRead ? "read" : "write") << endl;
+        // cout << (isRead ? "read" : "write") << endl;
         uint64_t offset = address - startAddress;
         assert(offset >= 0 && offset < length);
         if (isRead) {
@@ -590,8 +619,15 @@ class DataBlockSM {
     }
 
     friend class ThreadLocalStore;
-    friend void recordMemRead(THREADID tid, void* addr, uint32_t size, ADDRINT sp, ADDRINT ip);
-    friend void recordMemWrite(THREADID tid, void* addr, uint32_t size, ADDRINT sp, ADDRINT ip); 
+    friend void recordMemRead(THREADID tid, void* addr, uint32_t size,
+                              ADDRINT sp, ADDRINT ip);
+    friend void recordMemWrite(THREADID tid, void* addr, uint32_t size,
+                               ADDRINT sp, ADDRINT ip);
+    friend void afterEventSatisfy(THREADID tid, ocrGuid_t edtGuid,
+                                  ocrGuid_t eventGuid, ocrGuid_t dataGuid,
+                                  uint32_t slot);
+    friend void afterDbRelease(THREADID tid, ocrGuid_t edtGuid, ocrGuid_t dbGuid);
+
 };
 
 class ShadowMemory {
@@ -619,9 +655,15 @@ class ThreadLocalStore {
     std::vector<DataBlockSM*> acquiredDB;
 
    public:
-    void initialize(uint64_t taskID) {
+    void initialize(uint64_t taskID, uint32_t depc, ocrEdtDep_t* depv) {
         this->taskID = taskID;
         this->taskEpoch = START_EPOCH;
+        initializeAcquiredDB(depc, depv);
+    }
+    void cleanStaleData() {
+        this->taskID = NULL_ID;
+        this->taskEpoch = START_EPOCH;
+        acquiredDB.clear();
     }
     void increaseEpoch() { this->taskEpoch++; }
     uint32_t getEpoch() { return this->taskEpoch; }
@@ -633,12 +675,13 @@ class ThreadLocalStore {
    private:
     bool searchDB(uintptr_t addr, DataBlockSM** ptr, int* offset);
 
-    friend void recordMemRead(THREADID tid, void* addr, uint32_t size, ADDRINT sp, ADDRINT ip);
-    friend void recordMemWrite(THREADID tid, void* addr, uint32_t size, ADDRINT sp, ADDRINT ip); 
+    friend void recordMemRead(THREADID tid, void* addr, uint32_t size,
+                              ADDRINT sp, ADDRINT ip);
+    friend void recordMemWrite(THREADID tid, void* addr, uint32_t size,
+                               ADDRINT sp, ADDRINT ip);
 };
 
 void ThreadLocalStore::initializeAcquiredDB(uint32_t depc, ocrEdtDep_t* depv) {
-    acquiredDB.clear();
     acquiredDB.reserve(2 * depc);
     for (u32 i = 0; i < depc; i++) {
         if (depv[i].ptr) {
@@ -670,7 +713,7 @@ DataBlockSM* ThreadLocalStore::getDB(uintptr_t addr) {
 void ThreadLocalStore::removeDB(DataBlockSM* db) {
     int offset;
     bool isContain = searchDB(db->startAddress, nullptr, &offset);
-    //assert(isContain);
+    // assert(isContain);
     if (isContain) {
         acquiredDB.erase(acquiredDB.begin() + offset);
     }
@@ -679,7 +722,7 @@ void ThreadLocalStore::removeDB(DataBlockSM* db) {
 bool ThreadLocalStore::searchDB(uintptr_t addr, DataBlockSM** ptr,
                                 int* offset) {
 #ifdef DEBUG
-    *out << "search DB" << std::endl;
+    //*out << "search DB" << std::endl;
 #endif
     int start = 0, end = acquiredDB.size() - 1;
     bool isFind = false;
@@ -717,7 +760,7 @@ bool ThreadLocalStore::searchDB(uintptr_t addr, DataBlockSM** ptr,
     }
 
 #ifdef DEBUG
-    *out << "search DB end " << (isFind ? "found" : "unfound") << std::endl;
+    //*out << "search DB end " << (isFind ? "found" : "unfound") << std::endl;
 #endif
     return isFind;
 }
@@ -729,15 +772,15 @@ bool ThreadLocalStore::searchDB(uintptr_t addr, DataBlockSM** ptr,
 void preEdt(THREADID tid, ocrGuid_t edtGuid, uint32_t paramc, uint64_t* paramv,
             uint32_t depc, ocrEdtDep_t* depv, uint64_t* dbSizev) {
 #ifdef DEBUG
-    *out << "preEdt" << endl;
+    *out << "preEdt" << std::endl;
 #endif
     uint64_t taskID = guidMap.get(edtGuid.guid);
     ThreadLocalStore* tls =
         static_cast<ThreadLocalStore*>(PIN_GetThreadData(tls_key, tid));
-    tls->initialize(taskID);
+    tls->initialize(taskID, depc, depv);
     tls->increaseEpoch();
 #ifdef DEBUG
-    *out << "preEdt finish" << endl;
+    *out << "preEdt finish" << std::endl;
 #endif
 }
 
@@ -747,10 +790,10 @@ void afterEdtCreate(THREADID tid, ocrGuid_t guid, ocrGuid_t templateGuid,
                     ocrGuid_t* depv, uint16_t properties, ocrGuid_t outputEvent,
                     ocrGuid_t parent) {
 #ifdef DEBUG
-    *out << "afterEdtCreate" << endl;
+    *out << "afterEdtCreate" << std::endl;
 #endif
     if (depc >= 0xFFFFFFFE) {
-        cerr << "depc is invalid" << endl;
+        cerr << "depc is invalid" << std::endl;
         exit(0);
     }
     uint64_t taskID = generateTaskID();
@@ -781,44 +824,44 @@ void afterEdtCreate(THREADID tid, ocrGuid_t guid, ocrGuid_t templateGuid,
         associatedEvent->addDeps(taskID, dep);
     }
 #ifdef DEBUG
-    *out << "afterEdtCreate finish" << endl;
+    *out << "afterEdtCreate finish" << std::endl;
 #endif
 }
 
 void afterDbCreate(THREADID tid, ocrGuid_t guid, void* addr, uint64_t len,
                    uint16_t flags, ocrInDbAllocator_t allocator) {
 #ifdef DEBUG
-    *out << "afterDbCreate" << endl;
+    *out << "afterDbCreate" << std::endl;
 #endif
     DataBlockSM* newDB = new DataBlockSM((uintptr_t)addr, len);
     sm.insertDB(guid.guid, newDB);
     // new created DB is acquired by current EDT instantly
-    ThreadLocalStore* tls =
-        static_cast<ThreadLocalStore*>(PIN_GetThreadData(tls_key, tid));
-    tls->insertDB(newDB);
+    // ThreadLocalStore* tls =
+    // static_cast<ThreadLocalStore*>(PIN_GetThreadData(tls_key, tid));
+    // tls->insertDB(newDB);
 #ifdef DEBUG
-    cout << "afterDbCreate finish" << endl;
+    cout << "afterDbCreate finish" << std::endl;
 #endif
 }
 
 void afterEventCreate(ocrGuid_t guid, ocrEventTypes_t eventType,
                       uint16_t properties) {
 #ifdef DEBUG
-    *out << "afterEventCreate" << endl;
+    *out << "afterEventCreate" << std::endl;
 #endif
     uint64_t eventID = generateTaskID();
     guidMap.put(guid.guid, eventID);
     Event* event = new Event(eventID);
     computationGraph.insert(eventID, event);
 #ifdef DEBUG
-    *out << "afterEventCreate finish" << endl;
+    *out << "afterEventCreate finish" << std::endl;
 #endif
 }
 
 void afterAddDependence(ocrGuid_t source, ocrGuid_t destination, uint32_t slot,
                         ocrDbAccessMode_t mode) {
 #ifdef DEBUG
-    *out << "afterAddDependence" << endl;
+    *out << "afterAddDependence" << std::endl;
 #endif
     if (!isNullGuid(source)) {
         uint64_t dstID = guidMap.get(destination.guid);
@@ -835,14 +878,14 @@ void afterAddDependence(ocrGuid_t source, ocrGuid_t destination, uint32_t slot,
         }
     }
 #ifdef DEBUG
-    *out << "afterAddDependence finish" << endl;
+    *out << "afterAddDependence finish" << std::endl;
 #endif
 }
 
 void afterEventSatisfy(THREADID tid, ocrGuid_t edtGuid, ocrGuid_t eventGuid,
                        ocrGuid_t dataGuid, uint32_t slot) {
 #ifdef DEBUG
-    cout << "afterEventSatisfy" << endl;
+    cout << "afterEventSatisfy" << std::endl;
 #endif
     // According to spec, event satisfication should be treated that it happens
     // at once when all dependences are satisfied, even if in some case the
@@ -858,8 +901,13 @@ void afterEventSatisfy(THREADID tid, ocrGuid_t edtGuid, ocrGuid_t eventGuid,
     tls->increaseEpoch();
     assert(event != nullptr);
     event->addDeps(triggerTaskID, dep);
+    // after satisfy, the data block become shared
+    //DataBlockSM* db = sm.getDB(dataGuid.guid);
+    //if (!tls->getDB(db->startAddress)) {
+        //tls->insertDB(db);
+    //}
 #ifdef DEBUG
-    cout << "afterEventSatisfy finish" << endl;
+    cout << "afterEventSatisfy finish" << std::endl;
 #endif
 }
 
@@ -875,37 +923,54 @@ void afterEventSatisfy(THREADID tid, ocrGuid_t edtGuid, ocrGuid_t eventGuid,
 
 void afterEdtTerminate(THREADID tid, ocrGuid_t edtGuid) {
 #ifdef DEBUG
-    cout << "afterEdtTerminate" << endl;
+    cout << "afterEdtTerminate" << std::endl;
 #endif
     uint64_t taskID = guidMap.get(edtGuid.guid);
     ThreadLocalStore* tls =
         static_cast<ThreadLocalStore*>(PIN_GetThreadData(tls_key, tid));
     computationGraph.updateTaskFinalEpoch(taskID, tls->getEpoch());
+    tls->cleanStaleData();
 #ifdef DEBUG
-    cout << "afterEdtTerminate finish" << endl;
+    cout << "afterEdtTerminate finish" << std::endl;
+#endif
+}
+
+void afterDbRelease(THREADID tid, ocrGuid_t edtGuid, ocrGuid_t dbGuid) {
+#ifdef DEBUG
+    *out << "afterDbRelease" << std::endl;
+#endif
+    DataBlockSM* db = sm.getDB(dbGuid.guid);
+    ThreadLocalStore* tls =
+        static_cast<ThreadLocalStore*>(PIN_GetThreadData(tls_key, tid));
+    if (tls->getDB(db->startAddress)) {
+        tls->removeDB(db);
+    }
+#ifdef DEBUG
+    *out << "afterDbRelease finish" << std::endl;
 #endif
 }
 
 void afterDbDestroy(THREADID tid, ocrGuid_t dbGuid) {
 #ifdef DEBUG
-    *out << "afterDbDestroy" << endl;
+    *out << "afterDbDestroy" << std::endl;
 #endif
     DataBlockSM* db = sm.getDB(dbGuid.guid);
     if (db) {
         ThreadLocalStore* tls =
             static_cast<ThreadLocalStore*>(PIN_GetThreadData(tls_key, tid));
         tls->removeDB(db);
-        //delete db;
+        // cout << "thread " << tid << " delete " << db->startAddress << endl;
+        delete db;
     }
 #ifdef DEBUG
-    *out << "afterDbDestroy finish" << endl;
+    *out << "afterDbDestroy finish" << std::endl;
 #endif
 }
 
 void threadStart(THREADID tid, CONTEXT* ctxt, int32_t flags, void* v) {
     ThreadLocalStore* tls = new ThreadLocalStore();
     if (PIN_SetThreadData(tls_key, tls, tid) == FALSE) {
-        cerr << "PIN_SetThreadData failed" << endl;
+        cerr << "PIN_SetThreadData failed" << std::endl;
         PIN_ExitProcess(1);
     }
 }
@@ -920,14 +985,14 @@ void threadFini(THREADID tid, const CONTEXT* ctxt, int32_t code, void* v) {
 
 void fini(int32_t code, void* v) {
 #ifdef DEBUG
-    *out << "fini" << endl;
+    *out << "fini" << std::endl;
 #endif
 
 #ifdef MEASURE_TIME
     program_end = clock();
     double time_span = program_end - program_start;
     time_span /= CLOCKS_PER_SEC;
-    *out << "elapsed time: " << time_span << " seconds" << endl;
+    *out << "elapsed time: " << time_span << " seconds" << std::endl;
 #endif
 
 #ifdef OUTPUT_CG
@@ -942,7 +1007,7 @@ void fini(int32_t code, void* v) {
 
 void overload(IMG img, void* v) {
 #ifdef DEBUG
-    *out << "img: " << IMG_Name(img) << endl;
+    *out << "img: " << IMG_Name(img) << std::endl;
 #endif
 
     if (isOCRLibrary(img)) {
@@ -967,7 +1032,7 @@ void overload(IMG img, void* v) {
         RTN rtn = RTN_FindByName(img, "notifyEdtStart");
         if (RTN_Valid(rtn)) {
 #ifdef DEBUG
-            *out << "replace notifyEdtStart" << endl;
+            *out << "replace notifyEdtStart" << std::endl;
 #endif
             PROTO proto_notifyEdtStart = PROTO_Allocate(
                 PIN_PARG(void), CALLINGSTD_DEFAULT, "notifyEdtStart",
@@ -987,7 +1052,7 @@ void overload(IMG img, void* v) {
         rtn = RTN_FindByName(img, "notifyEdtCreate");
         if (RTN_Valid(rtn)) {
 #ifdef DEBUG
-            *out << "replace notifyEdtCreate" << endl;
+            *out << "replace notifyEdtCreate" << std::endl;
 #endif
             PROTO proto_notifyEdtCreate = PROTO_Allocate(
                 PIN_PARG(void), CALLINGSTD_DEFAULT, "notifyEdtCreate",
@@ -1012,7 +1077,7 @@ void overload(IMG img, void* v) {
         rtn = RTN_FindByName(img, "notifyDbCreate");
         if (RTN_Valid(rtn)) {
 #ifdef DEBUG
-            *out << "replace notifyDbCreate" << endl;
+            *out << "replace notifyDbCreate" << std::endl;
 #endif
             PROTO proto_notifyDbCreate = PROTO_Allocate(
                 PIN_PARG(void), CALLINGSTD_DEFAULT, "notifyDbCreate",
@@ -1033,7 +1098,7 @@ void overload(IMG img, void* v) {
         rtn = RTN_FindByName(img, "notifyEventCreate");
         if (RTN_Valid(rtn)) {
 #ifdef DEBUG
-            *out << "replace notifyEventCreate" << endl;
+            *out << "replace notifyEventCreate" << std::endl;
 #endif
             PROTO proto_notifyEventCreate = PROTO_Allocate(
                 PIN_PARG(void), CALLINGSTD_DEFAULT, "notifyEventCreate",
@@ -1051,7 +1116,7 @@ void overload(IMG img, void* v) {
         rtn = RTN_FindByName(img, "notifyAddDependence");
         if (RTN_Valid(rtn)) {
 #ifdef DEBUG
-            *out << "replace notifyAddDependence" << endl;
+            *out << "replace notifyAddDependence" << std::endl;
 #endif
             PROTO proto_notifyAddDependence = PROTO_Allocate(
                 PIN_PARG(void), CALLINGSTD_DEFAULT, "notifyAddDependence",
@@ -1070,7 +1135,7 @@ void overload(IMG img, void* v) {
         rtn = RTN_FindByName(img, "notifyEventSatisfy");
         if (RTN_Valid(rtn)) {
 #ifdef DEBUG
-            *out << "replace notifyEventSatisfy" << endl;
+            *out << "replace notifyEventSatisfy" << std::endl;
 #endif
             PROTO proto_notifyEventSatisfy = PROTO_Allocate(
                 PIN_PARG(void), CALLINGSTD_DEFAULT, "notifyEventSatisfy",
@@ -1090,7 +1155,7 @@ void overload(IMG img, void* v) {
         // rtn = RTN_FindByName(img, "notifyShutdown");
         // if (RTN_Valid(rtn)) {
         //#ifdef DEBUG
-        // *out << "replace notifyShutdown" << endl;
+        // *out << "replace notifyShutdown" << std::endl;
         //#endif
         // PROTO proto_notifyShutdown =
         // PROTO_Allocate(PIN_PARG(void), CALLINGSTD_DEFAULT,
@@ -1100,11 +1165,11 @@ void overload(IMG img, void* v) {
         // PROTO_Free(proto_notifyShutdown);
         //}
 
-        // replace notifyDBDestroy
+        // replace notifyDbDestroy
         rtn = RTN_FindByName(img, "notifyDbDestroy");
         if (RTN_Valid(rtn)) {
 #ifdef DEBUG
-            *out << "replace notifyDbDestroy" << endl;
+            *out << "replace notifyDbDestroy" << std::endl;
 #endif
             PROTO proto_notifyDbDestroy = PROTO_Allocate(
                 PIN_PARG(void), CALLINGSTD_DEFAULT, "notifyDbDestroy",
@@ -1115,11 +1180,28 @@ void overload(IMG img, void* v) {
             PROTO_Free(proto_notifyDbDestroy);
         }
 
+        // replace notifyDbRelease
+        rtn = RTN_FindByName(img, "notifyDbRelease");
+        if (RTN_Valid(rtn)) {
+#ifdef DEBUG
+            *out << "replace notifyDbRelease" << std::endl;
+#endif
+            PROTO proto_notifyDbRelease =
+                PROTO_Allocate(PIN_PARG(void), CALLINGSTD_DEFAULT,
+                               "notifyDbRelease", PIN_PARG_AGGREGATE(ocrGuid_t),
+                               PIN_PARG_AGGREGATE(ocrGuid_t), PIN_PARG_END());
+            RTN_ReplaceSignature(rtn, AFUNPTR(afterDbRelease), IARG_PROTOTYPE,
+                                 proto_notifyDbRelease, IARG_THREAD_ID,
+                                 IARG_FUNCARG_ENTRYPOINT_VALUE, 0,
+                                 IARG_FUNCARG_ENTRYPOINT_VALUE, 1, IARG_END);
+            PROTO_Free(proto_notifyDbRelease);
+        }
+
         // replace notifyEventPropagate
         // rtn = RTN_FindByName(img, "notifyEventPropagate");
         // if (RTN_Valid(rtn)) {
         //#ifdef DEBUG
-        //*out << "replace notifyEventPropagate" << endl;
+        //*out << "replace notifyEventPropagate" << std::endl;
         //#endif
         // PROTO proto_notifyEventPropagate = PROTO_Allocate(
         // PIN_PARG(void), CALLINGSTD_DEFAULT, "notifyEventPropagate",
@@ -1152,13 +1234,22 @@ void overload(IMG img, void* v) {
 //                Memory Operation Instrumentation                           //
 ///////////////////////////////////////////////////////////////////////////////
 
-void recordMemRead(THREADID tid, void* addr, uint32_t size, ADDRINT sp, ADDRINT ip) {
+void recordMemRead(THREADID tid, void* addr, uint32_t size, ADDRINT sp,
+                   ADDRINT ip) {
     ThreadLocalStore* tls =
-            static_cast<ThreadLocalStore*>(PIN_GetThreadData(tls_key, tid));
+        static_cast<ThreadLocalStore*>(PIN_GetThreadData(tls_key, tid));
     DataBlockSM* db = tls->getDB((uintptr_t)addr);
-    std::unordered_map<uint64_t, AccessRecord*> previousOPs;
+    std::unordered_map<uint64_t, uint32_t> epochs;
+    // cout << "thread " << tid << endl;
+    // for (auto dd : tls->acquiredDB) {
+    // cout << dd->startAddress << "--------" << dd->startAddress + dd->length
+    // << endl;
+    //}
+    // std::unordered_map<uint64_t, ADDRINT> ips;
     if (db) {
         AccessRecord* ar = new AccessRecord(tls->taskID, tls->taskEpoch, ip);
+        // ar->getSourceInfo();
+        // cout << "address: " << (uintptr_t)addr << endl;
         db->update((uintptr_t)addr, size, ar, true);
         uintptr_t offset = (uintptr_t)addr - db->startAddress;
         for (uintptr_t i = 0; i < size; i++) {
@@ -1166,11 +1257,13 @@ void recordMemRead(THREADID tid, void* addr, uint32_t size, ADDRINT sp, ADDRINT 
             byteSM.readLock();
             if (byteSM.hasWrite()) {
                 AccessRecord* write = byteSM.getWrite();
-                auto it = previousOPs.find(write->taskID);
-                if (it == previousOPs.end()) {
-                    previousOPs.insert(std::make_pair(write->taskID, write));
-                } else if (write->epoch > it->second->epoch) {
-                    it->second = write;
+                auto it = epochs.find(write->taskID);
+                if (it == epochs.end()) {
+                    epochs.insert(std::make_pair(write->taskID, write->epoch));
+                    // ips.insert(std::make_pair(write->taskID, write->ip));
+                } else if (write->epoch > it->second) {
+                    it->second = write->epoch;
+                    // ips[write->taskID] = write->ip;
                 }
             }
             byteSM.readUnlock();
@@ -1178,11 +1271,13 @@ void recordMemRead(THREADID tid, void* addr, uint32_t size, ADDRINT sp, ADDRINT 
     }
 }
 
-void recordMemWrite(THREADID tid, void* addr, uint32_t size, ADDRINT sp, ADDRINT ip) {
+void recordMemWrite(THREADID tid, void* addr, uint32_t size, ADDRINT sp,
+                    ADDRINT ip) {
     ThreadLocalStore* tls =
-            static_cast<ThreadLocalStore*>(PIN_GetThreadData(tls_key, tid));
+        static_cast<ThreadLocalStore*>(PIN_GetThreadData(tls_key, tid));
     DataBlockSM* db = tls->getDB((uintptr_t)addr);
-    std::unordered_map<uint64_t, AccessRecord*> previousOPs;
+    std::unordered_map<uint64_t, uint32_t> epochs;
+    // std::unordered_map<uint64_t, ADDRINT> ips;
     if (db) {
         AccessRecord* ar = new AccessRecord(tls->taskID, tls->taskEpoch, ip);
         db->update(uintptr_t(addr), size, ar, false);
@@ -1192,23 +1287,30 @@ void recordMemWrite(THREADID tid, void* addr, uint32_t size, ADDRINT sp, ADDRINT
             byteSM.readLock();
             if (byteSM.hasWrite()) {
                 AccessRecord* write = byteSM.getWrite();
-                auto it = previousOPs.find(write->taskID);
-                if (it == previousOPs.end()) {
-                    previousOPs.insert(std::make_pair(write->taskID, write));
-                } else if (write->epoch > it->second->epoch) {
-                    it->second = write;
+                auto it = epochs.find(write->taskID);
+                if (it == epochs.end()) {
+                    epochs.insert(std::make_pair(write->taskID, write->epoch));
+                    // ips.insert(std::make_pair(write->taskID, write->ip));
+                } else if (write->epoch > it->second) {
+                    it->second = write->epoch;
+                    // ips[write->taskID] = write->ip;
                 }
             }
             if (byteSM.hasRead()) {
-                for (auto rt = byteSM.getReads().begin(), re = byteSM.getReads().end(); rt != re; ++rt) {
+                for (auto rt = byteSM.getReads().begin(),
+                          re = byteSM.getReads().end();
+                     rt != re; ++rt) {
                     AccessRecord* read = rt->second;
-                    auto it = previousOPs.find(read->taskID);
-                    if (it == previousOPs.end()) {
-                        previousOPs.insert(std::make_pair(read->taskID, read));
-                    } else if (read->epoch > it->second->epoch) {
-                        it->second = read;
+                    auto it = epochs.find(read->taskID);
+                    if (it == epochs.end()) {
+                        epochs.insert(
+                            std::make_pair(read->taskID, read->epoch));
+                        // ips.insert(std::make_pair(read->taskID, read->ip));
+                    } else if (read->epoch > it->second) {
+                        it->second = read->epoch;
+                        // ips[read->taskID] = read->ip;
                     }
-                }    
+                }
             }
             byteSM.readUnlock();
         }
@@ -1244,15 +1346,20 @@ void instrumentInstruction(INS ins) {
 
 void instrumentRoutine(RTN rtn) {
     RTN_Open(rtn);
-    for (INS ins = RTN_InsHead(rtn); INS_Valid(ins); ins = INS_Next(ins)) {
-        instrumentInstruction(ins);
+#ifdef DEBUG
+    *out << "rtn: " << RTN_Name(rtn) << std::endl;
+#endif
+    if (!isOCRCall(rtn)) {
+        for (INS ins = RTN_InsHead(rtn); INS_Valid(ins); ins = INS_Next(ins)) {
+            instrumentInstruction(ins);
+        }
     }
     RTN_Close(rtn);
 }
 
 void instrumentImage(IMG img, void* v) {
 #ifdef DEBUG
-    cout << "instrument image\n";
+    *out << "instrument image" << std::endl;
 #endif
     if (isUserCodeImg(img)) {
         for (SEC sec = IMG_SecHead(img); SEC_Valid(sec); sec = SEC_Next(sec)) {
@@ -1263,17 +1370,17 @@ void instrumentImage(IMG img, void* v) {
         }
     }
 #ifdef DEBUG
-    cout << "instrument image finish\n";
+    *out << "instrument image finish" << std::endl;
 #endif
 }
 
 int usage() {
     cout << "OCR-Racer is a graph traversal based data race detector for "
             "Open Community Runtime"
-         << endl;
+         << std::endl;
     cout << "Usage: pin -t [path to OCR-Racer.so] -- [path to OCR "
             "app][arg1][arg2]..."
-         << endl;
+         << std::endl;
     return 1;
 }
 
@@ -1298,7 +1405,7 @@ void init(int argc, char* argv[]) {
         exit(1);
     }
     userCodeImg = argv[argi + 1];
-    *out << "User image is " << userCodeImg << endl;
+    *out << "User image is " << userCodeImg << std::endl;
     initSkippedLibrary();
 
     // logFile.open("log.txt");
@@ -1326,16 +1433,16 @@ int main(int argc, char* argv[]) {
     if (tls_key == INVALID_TLS_KEY) {
         cerr << "number of already allocated keys reached the "
                 "MAX_CLIENT_TLS_KEYS limit"
-             << endl;
+             << std::endl;
         PIN_ExitProcess(1);
     }
     PIN_AddThreadStartFunction(threadStart, NULL);
     PIN_AddThreadFiniFunction(threadFini, NULL);
     PIN_AddFiniFunction(fini, 0);
     IMG_AddInstrumentFunction(overload, 0);
-    #ifdef INSTRUMENT
+#ifdef INSTRUMENT
     IMG_AddInstrumentFunction(instrumentImage, 0);
-    #endif
+#endif
 
 #ifdef MEASURE_TIME
     program_start = clock();
