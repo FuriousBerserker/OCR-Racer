@@ -261,6 +261,8 @@ class ComputationGraph {
     Node* getNode(uint64_t key);
     bool isReachable(uint64_t srcID, uint32_t srcEpoch, uint64_t dstID,
                      uint32_t dstEpoch);
+    bool isReachable(std::unordered_map<uint64_t, uint32_t>& srcNodes,
+                     uint64_t dstID, uint32_t dstEpoch);
     void updateCache(uint64_t srcID, uint32_t srcEpoch, uint64_t dstID);
     void updateTaskFinalEpoch(uint64_t taskID, uint32_t epoch);
 #ifdef OUTPUT_CG
@@ -335,10 +337,13 @@ bool ComputationGraph::isReachable(uint64_t srcID, uint32_t srcEpoch,
     Node* dstNode = nodeMap.get(dstID);
     bool result = false;
     std::queue<Node*> q;
+    std::set<uint64_t> accessedNodes;
     q.push(dstNode);
+    accessedNodes.insert(dstID);
     while (!q.empty()) {
         Node* next = q.front();
         q.pop();
+        //cout << "current: " << next->id << endl;
         uint64_t cacheKey = generateCacheKey(srcID, next->id);
         uint32_t cacheEpoch = cacheMap.get(cacheKey);
         if (cacheEpoch >= srcEpoch) {
@@ -356,7 +361,11 @@ bool ComputationGraph::isReachable(uint64_t srcID, uint32_t srcEpoch,
                 break;
             }
             if (next->parent && next->parent->id != srcID) {
-                q.push(next->parent);
+                if (accessedNodes.find(next->parent->id) ==
+                    accessedNodes.end()) {
+                    accessedNodes.insert(next->parent->id);
+                    q.push(next->parent);
+                }
             }
             for (auto it = next->incomingEdges.begin(),
                       ie = next->incomingEdges.end();
@@ -365,12 +374,34 @@ bool ComputationGraph::isReachable(uint64_t srcID, uint32_t srcEpoch,
                 if (ancestor->id == srcID) {
                     continue;
                 }
-                while (ancestor->type == Node::EVENT &&
-                       ancestor->incomingEdges.getSize() == 1) {
-                    auto it = ancestor->incomingEdges.begin();
-                    ancestor = (*it).second->src;
+                while ((ancestor->type == Node::EVENT &&
+                       ancestor->incomingEdges.getSize() == 1) || (ancestor->type == Node::TASK && ancestor->incomingEdges.getSize() == 0)) {
+                    uint32_t ancestorEpoch;
+                    if (ancestor->type == Node::EVENT) {
+                        auto it = ancestor->incomingEdges.begin();
+                        ancestor = (*it).second->src;
+                        ancestorEpoch = (*it).second->epoch;
+                    } else {
+                        ancestorEpoch = ancestor->parentEpoch;
+                        ancestor = ancestor->parent;
+                    }
+                    if (!ancestor) {
+                        break;
+                    }
+                    if (ancestor->id == srcID) {
+                        if (ancestorEpoch >= srcEpoch) {
+                            result = true;
+                            updateCache(srcID, srcEpoch, dstID);
+                            return result;
+                        } else {
+                            break;
+                        }
+                    }
                 }
-                q.push(ancestor);
+                if (ancestor && ancestor->id != srcID && accessedNodes.find(ancestor->id) == accessedNodes.end()) {
+                    accessedNodes.insert(ancestor->id);
+                    q.push(ancestor);
+                }
             }
         }
     }
@@ -379,6 +410,62 @@ bool ComputationGraph::isReachable(uint64_t srcID, uint32_t srcEpoch,
         updateCache(srcID, srcEpoch, dstID);
     }
     return result;
+}
+
+bool ComputationGraph::isReachable(
+    std::unordered_map<uint64_t, uint32_t>& srcNodes, uint64_t dstID,
+    uint32_t dstEpoch) {
+    // auto it = srcNodes.find(dstID);
+    // if (it != srcNodes.end()) {
+    // srcNodes.erase(it);
+    //}
+    // Node* dstNode = nodeMap.get(dstID);
+    // bool result = false;
+    // std::queue<Node*> q;
+    // std::set<uint64_t> accessedNodes;
+    // q.push(dstNode);
+    // accessedNodes.insert(dstID);
+    // while (!q.empty()) {
+    // Node* next = q.front();
+    // q.pop();
+    // if (next->parent) {
+    // auto it = srcNodes.find(next->parent->id);
+    // if (it != srcNodes.end() && it->second <= next->parentEpoch) {
+    // srcNodes.erase(it);
+    //}
+    //}
+    // for (auto di = next->incomingEdges.begin(), de =
+    // next->incomingEdges.end(); di != de; ++di) {  Dep* dep = (*di).second; if
+    // (dep->src->type == Node::TASK) {  auto it = srcNodes.find(dep->src->id);
+    // if (it != srcNodes.end() && it->second <= dep->epoch) {
+    // srcNodes.erase(it);
+    //}
+    //}
+    //}
+    // if (srcNodes.empty()) {
+    // result = true;
+    // break;
+    //}
+    // if (next->parent) {
+    // if (accessedNodes.find(next->parent->id) == accessedNodes.end()) {
+    // accessedNodes.insert(next->parent->id);
+    // q.push(next->parent);
+    //}
+    //}
+    // for (auto di = next->incomingEdges.begin(), de =
+    // next->incomingEdges.end(); di != de; ++di) {  Node* ancestor =
+    // (*di).second->src;  while (ancestor->type == Node::EVENT &&
+    // ancestor->incomingEdges.getSize() == 1) {  auto it =
+    // ancestor->incomingEdges.begin();  ancestor = (*it).second->src;
+    //}
+    // if (accessedNodes.find(ancestor->id) != accessedNodes.end()) {
+    // accessedNodes.insert(ancestor->id);
+    // q.push(ancestor);
+    //}
+    //}
+    //}
+    // return result;
+    return true;
 }
 
 void ComputationGraph::updateCache(uint64_t srcID, uint32_t srcEpoch,
@@ -560,25 +647,24 @@ class ByteSM {
             this->write->decreaseRef();
         }
         this->write = other;
-        other->increaseRef();
         for (auto it = reads.begin(), ie = reads.end(); it != ie; it++) {
             it->second->decreaseRef();
         }
         this->reads.clear();
         PIN_RWMutexUnlock(&rwLock);
+        other->increaseRef();
     }
     void updateRead(AccessRecord* other) {
         PIN_RWMutexWriteLock(&rwLock);
         auto it = reads.find(other->taskID);
         if (it == reads.end()) {
-            other->increaseRef();
             reads.insert(std::make_pair(other->taskID, other));
-        } else if (it->second->epoch < other->epoch) {
+        } else {
             it->second->decreaseRef();
-            other->increaseRef();
             it->second = other;
         }
         PIN_RWMutexUnlock(&rwLock);
+        other->increaseRef();
     }
     std::unordered_map<uint64_t, AccessRecord*>& getReads() { return reads; }
     AccessRecord* getWrite() { return write; }
@@ -626,8 +712,8 @@ class DataBlockSM {
     friend void afterEventSatisfy(THREADID tid, ocrGuid_t edtGuid,
                                   ocrGuid_t eventGuid, ocrGuid_t dataGuid,
                                   uint32_t slot);
-    friend void afterDbRelease(THREADID tid, ocrGuid_t edtGuid, ocrGuid_t dbGuid);
-
+    friend void afterDbRelease(THREADID tid, ocrGuid_t edtGuid,
+                               ocrGuid_t dbGuid);
 };
 
 class ShadowMemory {
@@ -667,10 +753,27 @@ class ThreadLocalStore {
     }
     void increaseEpoch() { this->taskEpoch++; }
     uint32_t getEpoch() { return this->taskEpoch; }
+    void insertDB(DataBlockSM* db) {
+        int offset;
+        bool isContain = searchDB(db->startAddress, nullptr, &offset);
+        assert(!isContain);
+        acquiredDB.insert(acquiredDB.begin() + offset, db);
+    }
+    DataBlockSM* getDB(uintptr_t addr) {
+        DataBlockSM* db;
+        searchDB(addr, &db, nullptr);
+        return db;
+    }
+    void removeDB(DataBlockSM* db) {
+        int offset;
+        bool isContain = searchDB(db->startAddress, nullptr, &offset);
+        // assert(isContain);
+        if (isContain) {
+            acquiredDB.erase(acquiredDB.begin() + offset);
+        }
+    }
+
     void initializeAcquiredDB(uint32_t dpec, ocrEdtDep_t* depv);
-    void insertDB(DataBlockSM* db);
-    DataBlockSM* getDB(uintptr_t addr);
-    void removeDB(DataBlockSM* db);
 
    private:
     bool searchDB(uintptr_t addr, DataBlockSM** ptr, int* offset);
@@ -697,32 +800,10 @@ void ThreadLocalStore::initializeAcquiredDB(uint32_t depc, ocrEdtDep_t* depv) {
          });
 }
 
-void ThreadLocalStore::insertDB(DataBlockSM* db) {
-    int offset;
-    bool isContain = searchDB(db->startAddress, nullptr, &offset);
-    assert(!isContain);
-    acquiredDB.insert(acquiredDB.begin() + offset, db);
-}
-
-DataBlockSM* ThreadLocalStore::getDB(uintptr_t addr) {
-    DataBlockSM* db;
-    searchDB(addr, &db, nullptr);
-    return db;
-}
-
-void ThreadLocalStore::removeDB(DataBlockSM* db) {
-    int offset;
-    bool isContain = searchDB(db->startAddress, nullptr, &offset);
-    // assert(isContain);
-    if (isContain) {
-        acquiredDB.erase(acquiredDB.begin() + offset);
-    }
-}
-
 bool ThreadLocalStore::searchDB(uintptr_t addr, DataBlockSM** ptr,
                                 int* offset) {
 #ifdef DEBUG
-    //*out << "search DB" << std::endl;
+//*out << "search DB" << std::endl;
 #endif
     int start = 0, end = acquiredDB.size() - 1;
     bool isFind = false;
@@ -760,7 +841,8 @@ bool ThreadLocalStore::searchDB(uintptr_t addr, DataBlockSM** ptr,
     }
 
 #ifdef DEBUG
-    //*out << "search DB end " << (isFind ? "found" : "unfound") << std::endl;
+        //*out << "search DB end " << (isFind ? "found" : "unfound") <<
+        // std::endl;
 #endif
     return isFind;
 }
@@ -902,9 +984,9 @@ void afterEventSatisfy(THREADID tid, ocrGuid_t edtGuid, ocrGuid_t eventGuid,
     assert(event != nullptr);
     event->addDeps(triggerTaskID, dep);
     // after satisfy, the data block become shared
-    //DataBlockSM* db = sm.getDB(dataGuid.guid);
-    //if (!tls->getDB(db->startAddress)) {
-        //tls->insertDB(db);
+    // DataBlockSM* db = sm.getDB(dataGuid.guid);
+    // if (!tls->getDB(db->startAddress)) {
+    // tls->insertDB(db);
     //}
 #ifdef DEBUG
     cout << "afterEventSatisfy finish" << std::endl;
@@ -942,9 +1024,7 @@ void afterDbRelease(THREADID tid, ocrGuid_t edtGuid, ocrGuid_t dbGuid) {
     DataBlockSM* db = sm.getDB(dbGuid.guid);
     ThreadLocalStore* tls =
         static_cast<ThreadLocalStore*>(PIN_GetThreadData(tls_key, tid));
-    if (tls->getDB(db->startAddress)) {
-        tls->removeDB(db);
-    }
+    tls->removeDB(db);
 #ifdef DEBUG
     *out << "afterDbRelease finish" << std::endl;
 #endif
@@ -1240,6 +1320,7 @@ void recordMemRead(THREADID tid, void* addr, uint32_t size, ADDRINT sp,
         static_cast<ThreadLocalStore*>(PIN_GetThreadData(tls_key, tid));
     DataBlockSM* db = tls->getDB((uintptr_t)addr);
     std::unordered_map<uint64_t, uint32_t> epochs;
+    std::set<AccessRecord*> ars;
     // cout << "thread " << tid << endl;
     // for (auto dd : tls->acquiredDB) {
     // cout << dd->startAddress << "--------" << dd->startAddress + dd->length
@@ -1247,27 +1328,56 @@ void recordMemRead(THREADID tid, void* addr, uint32_t size, ADDRINT sp,
     //}
     // std::unordered_map<uint64_t, ADDRINT> ips;
     if (db) {
-        AccessRecord* ar = new AccessRecord(tls->taskID, tls->taskEpoch, ip);
-        // ar->getSourceInfo();
-        // cout << "address: " << (uintptr_t)addr << endl;
-        db->update((uintptr_t)addr, size, ar, true);
         uintptr_t offset = (uintptr_t)addr - db->startAddress;
         for (uintptr_t i = 0; i < size; i++) {
             ByteSM& byteSM = db->byteArray[offset + i];
             byteSM.readLock();
             if (byteSM.hasWrite()) {
                 AccessRecord* write = byteSM.getWrite();
-                auto it = epochs.find(write->taskID);
-                if (it == epochs.end()) {
-                    epochs.insert(std::make_pair(write->taskID, write->epoch));
-                    // ips.insert(std::make_pair(write->taskID, write->ip));
-                } else if (write->epoch > it->second) {
-                    it->second = write->epoch;
-                    // ips[write->taskID] = write->ip;
+                if (ars.find(write) == ars.end()) {
+                    ars.insert(write);
+                    auto it = epochs.find(write->taskID);
+                    if (it == epochs.end()) {
+                        epochs.insert(
+                            std::make_pair(write->taskID, write->epoch));
+                        // ips.insert(std::make_pair(write->taskID, write->ip));
+                    } else if (write->epoch > it->second) {
+                        it->second = write->epoch;
+                        // ips[write->taskID] = write->ip;
+                    }
                 }
             }
             byteSM.readUnlock();
         }
+
+        AccessRecord* ar = new AccessRecord(tls->taskID, tls->taskEpoch, ip);
+        db->update((uintptr_t)addr, size, ar, true);
+#ifdef DETECT_RACE
+        // if (epochs.size() == 1) {
+        // auto ei = epochs.begin();
+        // if (!computationGraph.isReachable(ei->first, ei->second, tls->taskID,
+        // tls->taskEpoch)) { *out << "read-write race" << std::endl;
+        // PIN_ExitProcess(1);
+        //}
+        //} else {
+        // if (!computationGraph.isReachable(epochs, tls->taskID,
+        // tls->taskEpoch)) { *out << "read-write race" << std::endl;
+        // PIN_ExitProcess(1);
+        //}
+        //}
+        for (auto ei = epochs.begin(), ee = epochs.end(); ei != ee; ei++) {
+            if (!computationGraph.isReachable(ei->first, ei->second,
+                                              tls->taskID, tls->taskEpoch)) {
+                *out << "read-write race" << std::endl;
+                *out << ei->first << "#" << ei->second << " is conflict with " << tls->taskID << "#" << tls->taskEpoch << std::endl;
+                //ofstream dotFile;
+                //dotFile.open("cg.dot");
+                //computationGraph.toDot(dotFile);
+                //dotFile.close();
+                PIN_ExitProcess(1);
+            }
+        }
+#endif
     }
 }
 
@@ -1277,23 +1387,26 @@ void recordMemWrite(THREADID tid, void* addr, uint32_t size, ADDRINT sp,
         static_cast<ThreadLocalStore*>(PIN_GetThreadData(tls_key, tid));
     DataBlockSM* db = tls->getDB((uintptr_t)addr);
     std::unordered_map<uint64_t, uint32_t> epochs;
+    std::set<AccessRecord*> ars;
     // std::unordered_map<uint64_t, ADDRINT> ips;
     if (db) {
-        AccessRecord* ar = new AccessRecord(tls->taskID, tls->taskEpoch, ip);
-        db->update(uintptr_t(addr), size, ar, false);
         uintptr_t offset = (uintptr_t)addr - db->startAddress;
         for (uintptr_t i = 0; i < size; i++) {
             ByteSM& byteSM = db->byteArray[offset + i];
             byteSM.readLock();
             if (byteSM.hasWrite()) {
                 AccessRecord* write = byteSM.getWrite();
-                auto it = epochs.find(write->taskID);
-                if (it == epochs.end()) {
-                    epochs.insert(std::make_pair(write->taskID, write->epoch));
-                    // ips.insert(std::make_pair(write->taskID, write->ip));
-                } else if (write->epoch > it->second) {
-                    it->second = write->epoch;
-                    // ips[write->taskID] = write->ip;
+                if (ars.find(write) == ars.end()) {
+                    ars.insert(write);
+                    auto it = epochs.find(write->taskID);
+                    if (it == epochs.end()) {
+                        epochs.insert(
+                            std::make_pair(write->taskID, write->epoch));
+                        // ips.insert(std::make_pair(write->taskID, write->ip));
+                    } else if (write->epoch > it->second) {
+                        it->second = write->epoch;
+                        // ips[write->taskID] = write->ip;
+                    }
                 }
             }
             if (byteSM.hasRead()) {
@@ -1301,19 +1414,51 @@ void recordMemWrite(THREADID tid, void* addr, uint32_t size, ADDRINT sp,
                           re = byteSM.getReads().end();
                      rt != re; ++rt) {
                     AccessRecord* read = rt->second;
-                    auto it = epochs.find(read->taskID);
-                    if (it == epochs.end()) {
-                        epochs.insert(
-                            std::make_pair(read->taskID, read->epoch));
-                        // ips.insert(std::make_pair(read->taskID, read->ip));
-                    } else if (read->epoch > it->second) {
-                        it->second = read->epoch;
-                        // ips[read->taskID] = read->ip;
+                    if (ars.find(read) == ars.end()) {
+                        ars.insert(read);
+                        auto it = epochs.find(read->taskID);
+                        if (it == epochs.end()) {
+                            epochs.insert(
+                                std::make_pair(read->taskID, read->epoch));
+                            // ips.insert(std::make_pair(read->taskID,
+                            // read->ip));
+                        } else if (read->epoch > it->second) {
+                            it->second = read->epoch;
+                            // ips[read->taskID] = read->ip;
+                        }
                     }
                 }
             }
             byteSM.readUnlock();
         }
+
+        AccessRecord* ar = new AccessRecord(tls->taskID, tls->taskEpoch, ip);
+        db->update(uintptr_t(addr), size, ar, false);
+
+#ifdef DETECT_RACE
+        // if (epochs.size() == 1) {
+        // auto ei = epochs.begin();
+        // if (!computationGraph.isReachable(ei->first, ei->second,
+        // tls->taskID, tls->taskEpoch)) {
+        //*out << "write race" << std::endl;
+        // PIN_ExitProcess(1);
+        //}
+        //} else {
+        // if (!computationGraph.isReachable(epochs, tls->taskID,
+        // tls->taskEpoch)) {
+        //*out << "write race" << std::endl;
+        // PIN_ExitProcess(1);
+        //}
+        //}
+        for (auto ei = epochs.begin(), ee = epochs.end(); ei != ee; ei++) {
+            if (!computationGraph.isReachable(ei->first, ei->second,
+                                              tls->taskID, tls->taskEpoch)) {
+                *out << "write race" << std::endl;
+                *out << ei->first << "#" << ei->second << " is conflict with " << tls->taskID << "#" << tls->taskEpoch << std::endl;
+                PIN_ExitProcess(1);
+            }
+        }
+#endif
     }
 }
 
