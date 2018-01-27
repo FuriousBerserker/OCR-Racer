@@ -24,10 +24,13 @@
 #include "ocr-types.h"
 
 //#define DEBUG
+#define GRAPH_CONSTRUCTION
 #define INSTRUMENT
 #define DETECT_RACE
 #define MEASURE_TIME
 //#define OUTPUT_CG
+//#define OUTPUT_SOURCE
+
 
 class Node;
 class Task;
@@ -156,6 +159,17 @@ bool isNullGuid(ocrGuid_t& guid) {
     } else {
         return false;
     }
+}
+
+std::string getSourceInfo(ADDRINT ip) {
+    int32_t column, line;
+    std::string file;
+    PIN_LockClient();
+    PIN_GetSourceLocation(ip, &column, &line, &file);
+    PIN_UnlockClient();
+    ss.str("");
+    ss << file << " " << line << " " << column;
+    return ss.str();
 }
 
     ////////////////////////////////////////////////////////////////////////////////
@@ -377,6 +391,7 @@ bool ComputationGraph::isReachable(uint64_t srcID, uint32_t srcEpoch,
                       ie = next->incomingEdges.end();
                  it != ie; ++it) {
                 Node* ancestor = (*it).second->src;
+                assert(ancestor);
                 if (ancestor->id == srcID) {
                     continue;
                 }
@@ -631,15 +646,8 @@ class AccessRecord {
         }
     }
 
-    std::string getSourceInfo() {
-        int32_t column, line;
-        std::string file;
-        PIN_LockClient();
-        PIN_GetSourceLocation(ip, &column, &line, &file);
-        PIN_UnlockClient();
-        ss.str("");
-        ss << file << " " << line << " " << column;
-        return ss.str();
+    std::string getLocation() {
+        return getSourceInfo(ip);
     }
 
     virtual ~AccessRecord() {}
@@ -779,6 +787,7 @@ class ThreadLocalStore {
     }
     void increaseEpoch() { this->taskEpoch++; }
     uint32_t getEpoch() { return this->taskEpoch; }
+    uint64_t getTaskID() {return this->taskID; }
     void insertDB(DataBlockSM* db) {
         int offset;
         bool isContain = searchDB(db->startAddress, nullptr, &offset);
@@ -966,7 +975,7 @@ void afterEventCreate(ocrGuid_t guid, ocrEventTypes_t eventType,
 #endif
 }
 
-void afterAddDependence(ocrGuid_t source, ocrGuid_t destination, uint32_t slot,
+void afterAddDependence(THREADID tid, ocrGuid_t source, ocrGuid_t destination, uint32_t slot,
                         ocrDbAccessMode_t mode) {
 #ifdef DEBUG
     *out << "afterAddDependence" << std::endl;
@@ -983,6 +992,19 @@ void afterAddDependence(ocrGuid_t source, ocrGuid_t destination, uint32_t slot,
             assert(srcID != NULL_ID);
             assert(src != nullptr);
             dst->addDeps(srcID, dep);
+        }
+        
+        //data dependence
+        if (srcID == NULL_ID && dstID != NULL_ID) {
+            Node* dst = computationGraph.getNode(dstID);
+            ThreadLocalStore* tls = static_cast<ThreadLocalStore*>(PIN_GetThreadData(tls_key, tid));
+            //bugs----between two tasks executing on the same thread continuously, there can be other code snippet executing in the thread
+            if (tls->getTaskID() != NULL_ID) {
+                Node* current = computationGraph.getNode(tls->getTaskID());
+                Dep dep(current, tls->getEpoch());
+                tls->increaseEpoch();
+                dst->addDeps(tls->getTaskID(), dep);
+            }
         }
     }
 #ifdef DEBUG
@@ -1231,7 +1253,7 @@ void overload(IMG img, void* v) {
                 PIN_PARG_END());
             RTN_ReplaceSignature(
                 rtn, AFUNPTR(afterAddDependence), IARG_PROTOTYPE,
-                proto_notifyAddDependence, IARG_FUNCARG_ENTRYPOINT_VALUE, 0,
+                proto_notifyAddDependence, IARG_THREAD_ID, IARG_FUNCARG_ENTRYPOINT_VALUE, 0,
                 IARG_FUNCARG_ENTRYPOINT_VALUE, 1, IARG_FUNCARG_ENTRYPOINT_VALUE,
                 2, IARG_FUNCARG_ENTRYPOINT_VALUE, 3, IARG_END);
             PROTO_Free(proto_notifyAddDependence);
@@ -1347,12 +1369,9 @@ void recordMemRead(THREADID tid, void* addr, uint32_t size, ADDRINT sp,
     DataBlockSM* db = tls->getDB((uintptr_t)addr);
     std::unordered_map<uint64_t, uint32_t> epochs;
     std::set<AccessRecord*> ars;
-    // cout << "thread " << tid << endl;
-    // for (auto dd : tls->acquiredDB) {
-    // cout << dd->startAddress << "--------" << dd->startAddress + dd->length
-    // << endl;
-    //}
-    // std::unordered_map<uint64_t, ADDRINT> ips;
+#ifdef OUTPUT_SOURCE
+    std::unordered_map<uint64_t, ADDRINT> ips;
+#endif
     if (db) {
         uintptr_t offset = (uintptr_t)addr - db->startAddress;
         for (uintptr_t i = 0; i < size; i++) {
@@ -1366,10 +1385,14 @@ void recordMemRead(THREADID tid, void* addr, uint32_t size, ADDRINT sp,
                     if (it == epochs.end()) {
                         epochs.insert(
                             std::make_pair(write->taskID, write->epoch));
-                        // ips.insert(std::make_pair(write->taskID, write->ip));
+#ifdef OUTPUT_SOURCE
+                        ips.insert(std::make_pair(write->taskID, write->ip));
+#endif
                     } else if (write->epoch > it->second) {
                         it->second = write->epoch;
-                        // ips[write->taskID] = write->ip;
+#ifdef OUTPUT_SOURCE
+                        ips[write->taskID] = write->ip;
+#endif
                     }
                 }
             }
@@ -1394,13 +1417,20 @@ void recordMemRead(THREADID tid, void* addr, uint32_t size, ADDRINT sp,
         for (auto ei = epochs.begin(), ee = epochs.end(); ei != ee; ei++) {
             if (!computationGraph.isReachable(ei->first, ei->second,
                                               tls->taskID, tls->taskEpoch)) {
-                *out << "read-write race" << std::endl;
+                *out << "write-read race" << std::endl;
                 *out << ei->first << "#" << ei->second << " is conflict with "
                      << tls->taskID << "#" << tls->taskEpoch << std::endl;
-                // ofstream dotFile;
-                // dotFile.open("cg.dot");
-                // computationGraph.toDot(dotFile);
-                // dotFile.close();
+#ifdef OUTPUT_SOURCE
+                *out << "write: " << getSourceInfo(ips[ei->first]) << std::endl; 
+                *out << "read:  " << getSourceInfo(ip) << std::endl;
+#endif
+
+#ifdef OUTPUT_CG
+                 ofstream dotFile;
+                 dotFile.open("cg.dot");
+                 computationGraph.toDot(dotFile);
+                 dotFile.close();
+#endif
                 PIN_ExitProcess(1);
             }
         }
@@ -1415,7 +1445,9 @@ void recordMemWrite(THREADID tid, void* addr, uint32_t size, ADDRINT sp,
     DataBlockSM* db = tls->getDB((uintptr_t)addr);
     std::unordered_map<uint64_t, uint32_t> epochs;
     std::set<AccessRecord*> ars;
-    // std::unordered_map<uint64_t, ADDRINT> ips;
+#ifdef OUTPUT_SOURCE
+    std::unordered_map<uint64_t, ADDRINT> ips;
+#endif
     if (db) {
         uintptr_t offset = (uintptr_t)addr - db->startAddress;
         for (uintptr_t i = 0; i < size; i++) {
@@ -1429,10 +1461,14 @@ void recordMemWrite(THREADID tid, void* addr, uint32_t size, ADDRINT sp,
                     if (it == epochs.end()) {
                         epochs.insert(
                             std::make_pair(write->taskID, write->epoch));
-                        // ips.insert(std::make_pair(write->taskID, write->ip));
+#ifdef OUTPUT_SOURCE
+                        ips.insert(std::make_pair(write->taskID, write->ip));
+#endif
                     } else if (write->epoch > it->second) {
                         it->second = write->epoch;
-                        // ips[write->taskID] = write->ip;
+#ifdef OUTPUT_SOURCE
+                        ips[write->taskID] = write->ip;
+#endif
                     }
                 }
             }
@@ -1447,11 +1483,14 @@ void recordMemWrite(THREADID tid, void* addr, uint32_t size, ADDRINT sp,
                         if (it == epochs.end()) {
                             epochs.insert(
                                 std::make_pair(read->taskID, read->epoch));
-                            // ips.insert(std::make_pair(read->taskID,
-                            // read->ip));
+#ifdef OUTPUT_SOURCE
+                            ips.insert(std::make_pair(read->taskID, read->ip));
+#endif
                         } else if (read->epoch > it->second) {
                             it->second = read->epoch;
-                            // ips[read->taskID] = read->ip;
+#ifdef OUTPUT_SOURCE
+                            ips[read->taskID] = read->ip;
+#endif
                         }
                     }
                 }
@@ -1483,6 +1522,17 @@ void recordMemWrite(THREADID tid, void* addr, uint32_t size, ADDRINT sp,
                 *out << "write race" << std::endl;
                 *out << ei->first << "#" << ei->second << " is conflict with "
                      << tls->taskID << "#" << tls->taskEpoch << std::endl;
+#ifdef OUTPUT_SOURCE
+                *out << "previous: " << getSourceInfo(ips[ei->first]) << std::endl; 
+                *out << "write:  " << getSourceInfo(ip) << std::endl;
+#endif
+
+#ifdef OUTPUT_CG
+                 ofstream dotFile;
+                 dotFile.open("cg.dot");
+                 computationGraph.toDot(dotFile);
+                 dotFile.close();
+#endif
                 PIN_ExitProcess(1);
             }
         }
@@ -1609,10 +1659,14 @@ int main(int argc, char* argv[]) {
              << std::endl;
         PIN_ExitProcess(1);
     }
+#ifdef GRAPH_CONSTRUCTION    
     PIN_AddThreadStartFunction(threadStart, NULL);
     PIN_AddThreadFiniFunction(threadFini, NULL);
-    PIN_AddFiniFunction(fini, 0);
     IMG_AddInstrumentFunction(overload, 0);
+#endif
+
+    PIN_AddFiniFunction(fini, 0);
+
 #ifdef INSTRUMENT
     IMG_AddInstrumentFunction(instrumentImage, 0);
 #endif
