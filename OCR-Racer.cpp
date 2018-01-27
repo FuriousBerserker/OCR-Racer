@@ -343,7 +343,7 @@ bool ComputationGraph::isReachable(uint64_t srcID, uint32_t srcEpoch,
     while (!q.empty()) {
         Node* next = q.front();
         q.pop();
-        //cout << "current: " << next->id << endl;
+        // cout << "current: " << next->id << endl;
         uint64_t cacheKey = generateCacheKey(srcID, next->id);
         uint32_t cacheEpoch = cacheMap.get(cacheKey);
         if (cacheEpoch >= srcEpoch) {
@@ -356,7 +356,7 @@ bool ComputationGraph::isReachable(uint64_t srcID, uint32_t srcEpoch,
                 break;
             }
             if (next->parent && next->parent->id == srcID &&
-                next->parent->parentEpoch >= srcEpoch) {
+                next->parentEpoch >= srcEpoch) {
                 result = true;
                 break;
             }
@@ -375,7 +375,9 @@ bool ComputationGraph::isReachable(uint64_t srcID, uint32_t srcEpoch,
                     continue;
                 }
                 while ((ancestor->type == Node::EVENT &&
-                       ancestor->incomingEdges.getSize() == 1) || (ancestor->type == Node::TASK && ancestor->incomingEdges.getSize() == 0)) {
+                        ancestor->incomingEdges.getSize() == 1) ||
+                       (ancestor->type == Node::TASK &&
+                        ancestor->incomingEdges.getSize() == 0)) {
                     uint32_t ancestorEpoch;
                     if (ancestor->type == Node::EVENT) {
                         auto it = ancestor->incomingEdges.begin();
@@ -398,7 +400,8 @@ bool ComputationGraph::isReachable(uint64_t srcID, uint32_t srcEpoch,
                         }
                     }
                 }
-                if (ancestor && ancestor->id != srcID && accessedNodes.find(ancestor->id) == accessedNodes.end()) {
+                if (ancestor && ancestor->id != srcID &&
+                    accessedNodes.find(ancestor->id) == accessedNodes.end()) {
                     accessedNodes.insert(ancestor->id);
                     q.push(ancestor);
                 }
@@ -918,9 +921,9 @@ void afterDbCreate(THREADID tid, ocrGuid_t guid, void* addr, uint64_t len,
     DataBlockSM* newDB = new DataBlockSM((uintptr_t)addr, len);
     sm.insertDB(guid.guid, newDB);
     // new created DB is acquired by current EDT instantly
-    // ThreadLocalStore* tls =
-    // static_cast<ThreadLocalStore*>(PIN_GetThreadData(tls_key, tid));
-    // tls->insertDB(newDB);
+    //ThreadLocalStore* tls =
+        //static_cast<ThreadLocalStore*>(PIN_GetThreadData(tls_key, tid));
+    //tls->insertDB(newDB);
 #ifdef DEBUG
     cout << "afterDbCreate finish" << std::endl;
 #endif
@@ -1369,11 +1372,12 @@ void recordMemRead(THREADID tid, void* addr, uint32_t size, ADDRINT sp,
             if (!computationGraph.isReachable(ei->first, ei->second,
                                               tls->taskID, tls->taskEpoch)) {
                 *out << "read-write race" << std::endl;
-                *out << ei->first << "#" << ei->second << " is conflict with " << tls->taskID << "#" << tls->taskEpoch << std::endl;
-                //ofstream dotFile;
-                //dotFile.open("cg.dot");
-                //computationGraph.toDot(dotFile);
-                //dotFile.close();
+                *out << ei->first << "#" << ei->second << " is conflict with "
+                     << tls->taskID << "#" << tls->taskEpoch << std::endl;
+                // ofstream dotFile;
+                // dotFile.open("cg.dot");
+                // computationGraph.toDot(dotFile);
+                // dotFile.close();
                 PIN_ExitProcess(1);
             }
         }
@@ -1454,7 +1458,8 @@ void recordMemWrite(THREADID tid, void* addr, uint32_t size, ADDRINT sp,
             if (!computationGraph.isReachable(ei->first, ei->second,
                                               tls->taskID, tls->taskEpoch)) {
                 *out << "write race" << std::endl;
-                *out << ei->first << "#" << ei->second << " is conflict with " << tls->taskID << "#" << tls->taskEpoch << std::endl;
+                *out << ei->first << "#" << ei->second << " is conflict with "
+                     << tls->taskID << "#" << tls->taskEpoch << std::endl;
                 PIN_ExitProcess(1);
             }
         }
