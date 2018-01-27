@@ -375,12 +375,6 @@ bool ComputationGraph::isReachable(uint64_t srcID, uint32_t srcEpoch,
                 break;
             }
             if (next->parent && next->parent->id != srcID) {
-                uint64_t cacheKey = generateCacheKey(srcID, next->parent->id);
-                uint32_t cacheEpoch = cacheMap.get(cacheKey);
-                if (cacheEpoch >= srcEpoch) {
-                    result = true;
-                    break;
-                }
                 if (accessedNodes.find(next->parent->id) ==
                     accessedNodes.end()) {
                     accessedNodes.insert(next->parent->id);
@@ -395,14 +389,6 @@ bool ComputationGraph::isReachable(uint64_t srcID, uint32_t srcEpoch,
                 if (ancestor->id == srcID) {
                     continue;
                 }
-                uint64_t cacheKey = generateCacheKey(srcID, ancestor->id);
-                uint32_t cacheEpoch = cacheMap.get(cacheKey);
-                if (cacheEpoch >= srcEpoch) {
-                    result = true;
-                    updateCache(srcID, srcEpoch, dstID);
-                    return result;
-                }
-
                 while ((ancestor->type == Node::EVENT &&
                         ancestor->incomingEdges.getSize() == 1) ||
                        (ancestor->type == Node::TASK &&
@@ -427,15 +413,6 @@ bool ComputationGraph::isReachable(uint64_t srcID, uint32_t srcEpoch,
                         } else {
                             break;
                         }
-                    } else {
-                        uint64_t cacheKey = generateCacheKey(srcID, ancestor->id);
-                        uint32_t cacheEpoch = cacheMap.get(cacheKey);
-                        if (cacheEpoch >= srcEpoch) {
-                            result = true;
-                            updateCache(srcID, srcEpoch, dstID);
-                            return result;
-                        }
-
                     }
                 }
                 if (ancestor && ancestor->id != srcID &&
