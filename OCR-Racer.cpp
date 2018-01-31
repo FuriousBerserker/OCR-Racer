@@ -274,7 +274,7 @@ class ComputationGraph {
     void insert(uint64_t key, Node* value);
     Node* getNode(uint64_t key);
     bool isReachable(uint64_t srcID, uint32_t srcEpoch, uint64_t dstID,
-                     uint32_t dstEpoch, std::unordered_map<uint64_t, uint32_t>& reachedNodes);
+                     uint32_t dstEpoch);
     bool isReachable(std::unordered_map<uint64_t, uint32_t>& srcNodes,
                      uint64_t dstID, uint32_t dstEpoch);
     void updateCache(uint64_t srcID, uint32_t srcEpoch, uint64_t dstID);
@@ -344,7 +344,7 @@ inline Node* ComputationGraph::getNode(uint64_t key) {
 
 // A BFS search to check the reachability between nodes
 bool ComputationGraph::isReachable(uint64_t srcID, uint32_t srcEpoch,
-                                   uint64_t dstID, uint32_t dstEpoch, std::unordered_map<uint64_t, uint32_t>& reachedNodes) {
+                                   uint64_t dstID, uint32_t dstEpoch) {
     if (srcID == dstID) {
         return true;
     }
@@ -379,9 +379,6 @@ bool ComputationGraph::isReachable(uint64_t srcID, uint32_t srcEpoch,
                     accessedNodes.end()) {
                     accessedNodes.insert(next->parent->id);
                     q.push(next->parent);
-                    if (reachedNodes[next->parent->id] < next->parentEpoch) {
-                        reachedNodes[next->parent->id] = next->parentEpoch;
-                    }
                 }
             }
             for (auto it = next->incomingEdges.begin(),
@@ -392,14 +389,11 @@ bool ComputationGraph::isReachable(uint64_t srcID, uint32_t srcEpoch,
                 if (ancestor->id == srcID) {
                     continue;
                 }
-                uint32_t ancestorEpoch = (*it).second->epoch;
-                if (reachedNodes[ancestor->id] < ancestorEpoch) {
-                    reachedNodes[ancestor->id] = ancestorEpoch;
-                }
                 while ((ancestor->type == Node::EVENT &&
                         ancestor->incomingEdges.getSize() == 1) ||
                        (ancestor->type == Node::TASK &&
                         ancestor->incomingEdges.getSize() == 0)) {
+                    uint32_t ancestorEpoch;
                     if (ancestor->type == Node::EVENT) {
                         auto it = ancestor->incomingEdges.begin();
                         ancestor = (*it).second->src;
@@ -419,9 +413,6 @@ bool ComputationGraph::isReachable(uint64_t srcID, uint32_t srcEpoch,
                         } else {
                             break;
                         }
-                    }
-                    if (reachedNodes[ancestor->id] < ancestorEpoch) {
-                        reachedNodes[ancestor->id] = ancestorEpoch;
                     }
                 }
                 if (ancestor && ancestor->id != srcID &&
@@ -1400,14 +1391,9 @@ void recordMemRead(THREADID tid, void* addr, uint32_t size, ADDRINT sp,
         // PIN_ExitProcess(1);
         //}
         //}
-        std::unordered_map<uint64_t, uint32_t> reachedNodes;
         for (auto ei = epochs.begin(), ee = epochs.end(); ei != ee; ei++) {
-            auto ri = reachedNodes.find(ei->first);
-            if (ri != reachedNodes.end() && ri->second >= ei->second) {
-                continue;
-            }
             if (!computationGraph.isReachable(ei->first, ei->second,
-                                              tls->taskID, tls->taskEpoch, reachedNodes)) {
+                                              tls->taskID, tls->taskEpoch)) {
                 *out << "write-read race" << std::endl;
                 *out << ei->first << "#" << ei->second << " is conflict with "
                      << tls->taskID << "#" << tls->taskEpoch << std::endl;
@@ -1507,14 +1493,9 @@ void recordMemWrite(THREADID tid, void* addr, uint32_t size, ADDRINT sp,
         // PIN_ExitProcess(1);
         //}
         //}
-        std::unordered_map<uint64_t, uint32_t> reachedNodes;
         for (auto ei = epochs.begin(), ee = epochs.end(); ei != ee; ei++) {
-            auto ri = reachedNodes.find(ei->first);
-            if (ri != reachedNodes.end() && ri->second >= ei->second) {
-                continue;
-            }
             if (!computationGraph.isReachable(ei->first, ei->second,
-                                              tls->taskID, tls->taskEpoch, reachedNodes)) {
+                                              tls->taskID, tls->taskEpoch)) {
                 *out << "write race" << std::endl;
                 *out << ei->first << "#" << ei->second << " is conflict with "
                      << tls->taskID << "#" << tls->taskEpoch << std::endl;
