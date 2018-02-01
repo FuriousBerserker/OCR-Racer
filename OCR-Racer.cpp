@@ -26,7 +26,7 @@
 //#define DEBUG
 #define GRAPH_CONSTRUCTION
 #define INSTRUMENT
-#define DETECT_RACE
+//#define DETECT_RACE
 #define MEASURE_TIME
 //#define OUTPUT_CG
 //#define OUTPUT_SOURCE
@@ -38,7 +38,7 @@ class Event;
 class ComputationMap;
 
 #ifdef MEASURE_TIME
-clock_t program_start, program_end;
+struct timeval program_start, program_end;
 #endif
 
 const uint32_t NULL_ID = 0;
@@ -1094,10 +1094,9 @@ void fini(int32_t code, void* v) {
 #endif
 
 #ifdef MEASURE_TIME
-    program_end = clock();
-    double time_span = program_end - program_start;
-    time_span /= CLOCKS_PER_SEC;
-    *out << "elapsed time: " << time_span << " seconds" << std::endl;
+    gettimeofday(&program_end, nullptr);
+    time_t time_span = (program_end.tv_sec - program_start.tv_sec) * 1000000 + (program_end.tv_usec - program_start.tv_usec);
+    *out << "elapsed time: " << time_span << " us" << std::endl;
 #endif
 
 #ifdef OUTPUT_CG
@@ -1649,7 +1648,7 @@ int main(int argc, char* argv[]) {
 #endif
 
 #ifdef MEASURE_TIME
-    program_start = clock();
+    gettimeofday(&program_start, nullptr);
 #endif
     PIN_StartProgram();
     return 0;
