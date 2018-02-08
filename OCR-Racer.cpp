@@ -24,10 +24,11 @@
 #include "ocr-types.h"
 
 //#define DEBUG
-#define GRAPH_CONSTRUCTION
-#define INSTRUMENT
+//#define GRAPH_CONSTRUCTION
+//#define INSTRUMENT
 //#define DETECT_RACE
-#define MEASURE_TIME
+//#define MEASURE_TIME
+//#define STATISTICS
 //#define OUTPUT_CG
 //#define OUTPUT_SOURCE
 
@@ -281,6 +282,10 @@ class ComputationGraph {
     void updateTaskFinalEpoch(uint64_t taskID, uint32_t epoch);
 #ifdef OUTPUT_CG
     void toDot(std::ostream& out);
+#endif
+
+#ifdef STATISTICS
+    void showStatistics(std::ostream& out);
 #endif
    private:
 #ifdef OUTPUT_CG
@@ -587,6 +592,29 @@ void ComputationGraph::outputLink(std::ostream& out, Node* n1, uint32_t epoch1,
     out << '\"';
     out << ' ' << edgeColorSchemes.find(edgeType)->second.toString();
     out << ';' << std::endl;
+}
+#endif
+
+
+#ifdef STATISTICS
+void ComputationGraph::showStatistics(std::ostream& out) {
+   uint64_t taskNum = 0, eventNum = 0, edgeNum = 0;
+   for (auto ni = nodeMap.begin(), ne = nodeMap.end(); ni != ne; ++ni) {
+        Node* node = (*ni).second;
+        if (node->type == Node::TASK) {
+            taskNum += 1;
+            edgeNum += node->incomingEdges.getSize();
+            if (node->parent) {
+                edgeNum += 1;
+            }
+        } else {
+            eventNum += 1;
+            edgeNum += node->incomingEdges.getSize();
+        }
+   } 
+   out << "task: " << taskNum << std::endl;
+   out << "event: " << eventNum << std::endl;
+   out << "edge: " << edgeNum << std::endl;
 }
 #endif
 
@@ -1104,6 +1132,10 @@ void fini(int32_t code, void* v) {
     dotFile.open("cg.dot");
     computationGraph.toDot(dotFile);
     dotFile.close();
+#endif
+
+#ifdef STATISTICS
+    computationGraph.showStatistics(*out);
 #endif
     // errorFile.close();
     // logFile.close();
