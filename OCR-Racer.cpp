@@ -24,10 +24,10 @@
 #include "ocr-types.h"
 
 //#define DEBUG
-#define GRAPH_CONSTRUCTION
-#define INSTRUMENT
-#define DETECT_RACE
-#define MEASURE_TIME
+//#define GRAPH_CONSTRUCTION
+//#define INSTRUMENT
+//#define DETECT_RACE
+//#define MEASURE_TIME
 //#define STATISTICS
 //#define OUTPUT_CG
 //#define OUTPUT_SOURCE
@@ -228,16 +228,17 @@ class Node {
     Task* parent;
     uint32_t parentEpoch;
     Type type;
+    uint64_t depth;
 
    public:
     uint64_t id;
-    uint64_t depth;
 
    public:
     Node(uint64_t id, Type type, Task* parent, uint32_t parentEpoch);
     virtual ~Node();
     void addDeps(uint64_t id, Dep& dep);
     void calculateDepth();
+    uint64_t getDepth();
 
     friend class ComputationGraph;
 };
@@ -303,8 +304,8 @@ Node::Node(uint64_t id, Type type, Task* parent, uint32_t parentEpoch)
       parent(parent),
       parentEpoch(parentEpoch),
       type(type),
-      id(id),
-      depth(0) {}
+      depth(0),
+      id(id) {}
 
 Node::~Node() {}
 
@@ -317,20 +318,27 @@ inline void Node::addDeps(uint64_t id, Dep& dep) {
 inline void Node::calculateDepth() {
     for (auto ei = incomingEdges.begin(), ee = incomingEdges.end(); ei != ee; ++ei) {
         Node* prev = (*ei).second->src;
-        if (prev->depth == 0) {
-            prev->calculateDepth();
-        }
-        if (depth < prev->depth) {
-            depth = prev->depth;
+        uint64_t prevDepth = prev->getDepth();
+        if (depth < prevDepth) {
+            depth = prevDepth;
         }
     }
 
-    if (parent && depth < parent->depth) {
-        depth = parent->depth;
+    if (parent) {
+        uint64_t parentDepth = parent->getDepth();
+        if (depth < parentDepth) {
+            depth = parentDepth;
+        }
     }
     depth += 1;
 }
 
+inline uint64_t Node::getDepth() {
+    if (depth == 0) {
+        calculateDepth();
+    }
+    return depth;
+}
 Task::Task(uint64_t id, Task* parent, uint32_t parentEpoch)
     : Node(id, Node::TASK, parent, parentEpoch) {}
 
@@ -400,7 +408,7 @@ bool ComputationGraph::isReachable(uint64_t srcID, uint32_t srcEpoch,
                 result = true;
                 break;
             }
-            if (next->parent && next->parent->id != srcID && next->parent->depth >= srcNode->depth) {
+            if (next->parent && next->parent->id != srcID && next->parent->getDepth() > srcNode->getDepth()) {
                 if (accessedNodes.find(next->parent->id) ==
                     accessedNodes.end()) {
                     accessedNodes.insert(next->parent->id);
@@ -415,7 +423,7 @@ bool ComputationGraph::isReachable(uint64_t srcID, uint32_t srcEpoch,
                 if (ancestor->id == srcID) {
                     continue;
                 }
-                if (ancestor->depth < srcNode->depth) {
+                if (ancestor->getDepth() <= srcNode->getDepth()) {
                     continue;
                 }
                 while ((ancestor->type == Node::EVENT &&
