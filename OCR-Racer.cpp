@@ -24,10 +24,10 @@
 #include "ocr-types.h"
 
 //#define DEBUG
-//#define GRAPH_CONSTRUCTION
-//#define INSTRUMENT
-//#define DETECT_RACE
-//#define MEASURE_TIME
+#define GRAPH_CONSTRUCTION
+#define INSTRUMENT
+#define DETECT_RACE
+#define MEASURE_TIME
 //#define STATISTICS
 //#define OUTPUT_CG
 //#define OUTPUT_SOURCE
@@ -231,11 +231,13 @@ class Node {
 
    public:
     uint64_t id;
+    uint64_t depth;
 
    public:
     Node(uint64_t id, Type type, Task* parent, uint32_t parentEpoch);
     virtual ~Node();
     void addDeps(uint64_t id, Dep& dep);
+    void calculateDepth();
 
     friend class ComputationGraph;
 };
@@ -301,7 +303,8 @@ Node::Node(uint64_t id, Type type, Task* parent, uint32_t parentEpoch)
       parent(parent),
       parentEpoch(parentEpoch),
       type(type),
-      id(id) {}
+      id(id),
+      depth(0) {}
 
 Node::~Node() {}
 
@@ -309,6 +312,23 @@ inline void Node::addDeps(uint64_t id, Dep& dep) {
     Dep* copy = new Dep(dep);
     incomingEdges.put(id, copy);
     //*out << id << "#" << dep.epoch << "->" << this->id << std::endl;
+}
+
+inline void Node::calculateDepth() {
+    for (auto ei = incomingEdges.begin(), ee = incomingEdges.end(); ei != ee; ++ei) {
+        Node* prev = (*ei).second->src;
+        if (prev->depth == 0) {
+            prev->calculateDepth();
+        }
+        if (depth < prev->depth) {
+            depth = prev->depth;
+        }
+    }
+
+    if (parent && depth < parent->depth) {
+        depth = parent->depth;
+    }
+    depth += 1;
 }
 
 Task::Task(uint64_t id, Task* parent, uint32_t parentEpoch)
@@ -354,6 +374,7 @@ bool ComputationGraph::isReachable(uint64_t srcID, uint32_t srcEpoch,
         return true;
     }
     Node* dstNode = nodeMap.get(dstID);
+    Node* srcNode = nodeMap.get(srcID);
     bool result = false;
     std::queue<Node*> q;
     std::set<uint64_t> accessedNodes;
@@ -379,7 +400,7 @@ bool ComputationGraph::isReachable(uint64_t srcID, uint32_t srcEpoch,
                 result = true;
                 break;
             }
-            if (next->parent && next->parent->id != srcID) {
+            if (next->parent && next->parent->id != srcID && next->parent->depth >= srcNode->depth) {
                 if (accessedNodes.find(next->parent->id) ==
                     accessedNodes.end()) {
                     accessedNodes.insert(next->parent->id);
@@ -392,6 +413,9 @@ bool ComputationGraph::isReachable(uint64_t srcID, uint32_t srcEpoch,
                 Node* ancestor = (*it).second->src;
                 assert(ancestor);
                 if (ancestor->id == srcID) {
+                    continue;
+                }
+                if (ancestor->depth < srcNode->depth) {
                     continue;
                 }
                 while ((ancestor->type == Node::EVENT &&
@@ -901,6 +925,8 @@ void preEdt(THREADID tid, ocrGuid_t edtGuid, uint32_t paramc, uint64_t* paramv,
         static_cast<ThreadLocalStore*>(PIN_GetThreadData(tls_key, tid));
     tls->initialize(taskID, depc, depv);
     tls->increaseEpoch();
+    Node* task = computationGraph.getNode(taskID);
+    task->calculateDepth();
 #ifdef DEBUG
     *out << "preEdt finish" << std::endl;
 #endif
@@ -1020,7 +1046,7 @@ void afterAddDependence(THREADID tid, ocrGuid_t source, ocrGuid_t destination, u
 void afterEventSatisfy(THREADID tid, ocrGuid_t edtGuid, ocrGuid_t eventGuid,
                        ocrGuid_t dataGuid, uint32_t slot) {
 #ifdef DEBUG
-    cout << "afterEventSatisfy" << std::endl;
+    *out << "afterEventSatisfy" << std::endl;
 #endif
     // According to spec, event satisfication should be treated that it happens
     // at once when all dependences are satisfied, even if in some case the
@@ -1042,23 +1068,23 @@ void afterEventSatisfy(THREADID tid, ocrGuid_t edtGuid, ocrGuid_t eventGuid,
     // tls->insertDB(db);
     //}
 #ifdef DEBUG
-    cout << "afterEventSatisfy finish" << std::endl;
+    *out << "afterEventSatisfy finish" << std::endl;
 #endif
 }
 
-// void afterEventPropagate(ocrGuid_t eventGuid) {
+//void afterEventPropagate(ocrGuid_t eventGuid) {
 //#ifdef DEBUG
-// cout << "afterEventPropagate" << endl;
+ //*out << "afterEventPropagate" << std::endl;
 //#endif
 //
 //#ifdef DEBUG
-// cout << "afterEventPropagate finish" << endl;
+ //*out << "afterEventPropagate finish" << std::endl;
 //#endif
 //}
 
 void afterEdtTerminate(THREADID tid, ocrGuid_t edtGuid) {
 #ifdef DEBUG
-    cout << "afterEdtTerminate" << std::endl;
+    *out << "afterEdtTerminate" << std::endl;
 #endif
     uint64_t taskID = guidMap.get(edtGuid.guid);
     ThreadLocalStore* tls =
@@ -1066,7 +1092,7 @@ void afterEdtTerminate(THREADID tid, ocrGuid_t edtGuid) {
     computationGraph.updateTaskFinalEpoch(taskID, tls->getEpoch());
     tls->cleanStaleData();
 #ifdef DEBUG
-    cout << "afterEdtTerminate finish" << std::endl;
+    *out << "afterEdtTerminate finish" << std::endl;
 #endif
 }
 
@@ -1333,19 +1359,19 @@ void overload(IMG img, void* v) {
             PROTO_Free(proto_notifyDbRelease);
         }
 
-        // replace notifyEventPropagate
-        // rtn = RTN_FindByName(img, "notifyEventPropagate");
-        // if (RTN_Valid(rtn)) {
+         // replace notifyEventPropagate
+         //rtn = RTN_FindByName(img, "notifyEventPropagate");
+         //if (RTN_Valid(rtn)) {
         //#ifdef DEBUG
         //*out << "replace notifyEventPropagate" << std::endl;
         //#endif
-        // PROTO proto_notifyEventPropagate = PROTO_Allocate(
-        // PIN_PARG(void), CALLINGSTD_DEFAULT, "notifyEventPropagate",
-        // PIN_PARG_AGGREGATE(ocrGuid_t), PIN_PARG_END());
-        // RTN_ReplaceSignature(rtn, AFUNPTR(afterEventPropagate),
-        // IARG_PROTOTYPE, proto_notifyEventPropagate,
-        // IARG_FUNCARG_ENTRYPOINT_VALUE, 0, IARG_END);
-        // PROTO_Free(proto_notifyEventPropagate);
+         //PROTO proto_notifyEventPropagate = PROTO_Allocate(
+         //PIN_PARG(void), CALLINGSTD_DEFAULT, "notifyEventPropagate",
+         //PIN_PARG_AGGREGATE(ocrGuid_t), PIN_PARG_END());
+         //RTN_ReplaceSignature(rtn, AFUNPTR(afterEventPropagate),
+         //IARG_PROTOTYPE, proto_notifyEventPropagate,
+         //IARG_FUNCARG_ENTRYPOINT_VALUE, 0, IARG_END);
+         //PROTO_Free(proto_notifyEventPropagate);
         //}
 
         // replace notifyEdtTerminate
