@@ -24,12 +24,12 @@
 #include "ocr-types.h"
 
 //#define DEBUG
-//#define GRAPH_CONSTRUCTION
-//#define INSTRUMENT
-//#define DETECT_RACE
-//#define MEASURE_TIME
+#define GRAPH_CONSTRUCTION
+#define INSTRUMENT
+#define DETECT_RACE
+#define MEASURE_TIME
 //#define STATISTICS
-//#define OUTPUT_CG
+#define OUTPUT_CG
 //#define OUTPUT_SOURCE
 
 
@@ -173,9 +173,9 @@ std::string getSourceInfo(ADDRINT ip) {
     return ss.str();
 }
 
-    ////////////////////////////////////////////////////////////////////////////////
-    //                            Computation Graph //
-    ///////////////////////////////////////////////////////////////////////////////
+////////////////////////////////////////////////////////////////////////////////
+//                            Computation Graph                               //
+///////////////////////////////////////////////////////////////////////////////
 
 #ifdef OUTPUT_CG
 class ColorScheme {
@@ -241,6 +241,10 @@ class Node {
     uint64_t getDepth();
 
     friend class ComputationGraph;
+    friend class VC;
+    friend void preEdt(THREADID tid, ocrGuid_t edtGuid, uint32_t paramc, uint64_t* paramv,
+            uint32_t depc, ocrEdtDep_t* depv, uint64_t* dbSizev);
+    friend void afterEventPropagate(ocrGuid_t eventGuid); 
 };
 
 class Task : public Node {
@@ -653,92 +657,228 @@ void ComputationGraph::showStatistics(std::ostream& out) {
 ComputationGraph computationGraph(10000);
 
 ////////////////////////////////////////////////////////////////////////////////
+//                           Vector Clock                                    //
+///////////////////////////////////////////////////////////////////////////////
+class VC {
+   public:
+    // vector clock representation
+    map<uint64_t, uint64_t> clockMap;
+    bool shadowMemory;
+    // epoch representation
+    uint64_t taskID;
+    uint64_t epoch;
+    bool merged;
+    VC();
+    VC(uint64_t taskID);
+    VC(const VC& vc, uint64_t taskID);
+    bool isShadowMemory() const;
+    bool isEmpty() const;
+    bool isEpoch() const;
+    friend bool operator<=(const VC& vc1, const VC& vc2);
+    void increment();
+    void merge(const VC& vc);
+    void update(uint64_t taskID, uint64_t epoch, bool isOverride);
+    void clear();
+    uint64_t getOwnClock();
+    string toString() const;
+    void selfMerge();
+    bool isMerged() const;
+    void setMerged(bool merged); 
+};
+
+ConcurrentHashMap<uint64_t, VC*, nullptr, IdentityHash<uint64_t> > vcMap(10000);
+
+VC::VC() : shadowMemory(true), taskID(NULL_ID), epoch(START_EPOCH), merged(false) {}
+
+VC::VC(uint64_t taskID) : shadowMemory(false), taskID(taskID), epoch(START_EPOCH), merged(false) {
+    clockMap[taskID] = START_EPOCH;
+}
+
+VC::VC(const VC& vc, uint64_t taskID) : clockMap(vc.clockMap), shadowMemory(vc.shadowMemory), taskID(taskID), epoch(vc.epoch), merged(false) {
+    clockMap[taskID] = START_EPOCH;
+}
+
+inline bool VC::isShadowMemory() const { return this->shadowMemory; }
+
+inline bool VC::isEmpty() const {
+   return taskID == NULL_ID && clockMap.empty();
+}
+
+inline bool VC::isEpoch() const {
+    assert(isShadowMemory());
+    return clockMap.empty();
+}
+
+void VC::increment() {
+    assert(!isShadowMemory());
+    clockMap[taskID]++;
+}
+
+void VC::merge(const VC& vc) {
+    assert(!this->isShadowMemory() && !vc.isShadowMemory());
+    for (auto ci = vc.clockMap.begin(), ce = vc.clockMap.end(); ci != ce; ci++) {
+       auto ci2 = clockMap.find(ci->first);
+        if (ci2 != clockMap.end()) {
+            ci2->second = (ci2->second > ci->second ? ci2->second : ci->second); 
+        } else {
+            clockMap[ci->first] = ci->second;
+        }
+    }
+}
+
+void VC::update(uint64_t taskID, uint64_t epoch, bool isOverride) {
+    assert(isShadowMemory());
+    if (isOverride) {
+        this->taskID = taskID;
+        this->epoch = epoch;
+    } else {
+        if (isEpoch()) {
+            if (this->taskID == NULL_ID) {
+                this->taskID = taskID;
+                this->epoch = epoch;
+            } else if (this->taskID == taskID) {
+                this->epoch = epoch;
+            } else {
+                clockMap[taskID] = epoch;
+                clockMap[this->taskID] = this->epoch;
+                this->taskID = NULL_ID;
+                this->epoch = START_EPOCH;
+            }
+        } else {
+            clockMap[taskID] = epoch;
+        }
+    }
+}
+
+inline void VC::clear() {
+    assert(isShadowMemory());
+    clockMap.clear();
+    this->taskID = NULL_ID;
+    this->epoch = START_EPOCH;
+}
+
+inline uint64_t VC::getOwnClock() {
+    return clockMap[taskID];
+}
+
+string VC::toString() const {
+    std::stringstream ss;
+    if (isShadowMemory()) {
+        if (isEmpty()) {
+            ss << "[]";
+        } else if (isEpoch()) {
+            ss << '[';
+            ss << taskID;
+            ss << " -> ";
+            ss << epoch;
+            ss << ']';
+        } else {
+            ss << '[';
+            for (auto ci = clockMap.begin(), ce = clockMap.end(); ci != ce; ci++) {
+                ss << ci->first;
+                ss << " -> ";
+                ss << ci->second;
+                ss << std::endl;
+            }
+            ss << ']';
+        }
+    } else {
+        ss << '[';
+        for (auto ci = clockMap.begin(), ce = clockMap.end(); ci != ce; ci++) {
+            ss << ci->first;
+            ss << " -> ";
+            ss << ci->second;
+            ss << std::endl;
+        }
+        ss << ']';
+    }
+    return ss.str();
+}
+
+void VC::selfMerge() {
+    Node* node = computationGraph.getNode(taskID);
+    if (!merged) {
+        for (auto ei = node->incomingEdges.begin(), ee = node->incomingEdges.end(); ei != ee; ++ei) {
+            Dep* dep = (*ei).second;
+            VC* prevVC = vcMap.get(dep->src->id);
+            if (!prevVC->merged) {
+                prevVC->selfMerge();
+            }
+            this->merge(*prevVC);
+        }
+    }
+    merged = true;
+}
+
+inline bool VC::isMerged() const {
+    return merged;
+}
+
+inline void VC::setMerged(bool merged) {
+    this->merged = merged;
+}
+
+inline bool operator<=(const VC& vc1, const VC& vc2) {
+    assert(vc1.isShadowMemory() && !vc2.isShadowMemory());
+    //    cout << vc1.toString() << endl;
+    //    cout << vc2.toString() << endl;
+    bool result = true;
+    if (vc1.isEpoch()) {
+        auto ci2 = vc2.clockMap.find(vc1.taskID);
+        if (ci2 == vc2.clockMap.end() || ci2->second < vc1.epoch) {
+            result = false;
+        }
+    } else {
+        for (auto ci = vc1.clockMap.begin(), ce = vc1.clockMap.end(); ci != ce; ci++) {
+            auto ci2 = vc2.clockMap.find(ci->first);
+            if (ci2 == vc2.clockMap.end() || ci2->second < ci->second) {
+                result = false;
+                break;
+            }
+        }
+    }
+    return result;
+}
+
+
+
+
+////////////////////////////////////////////////////////////////////////////////
 //                                Shadow Memory                              //
 ///////////////////////////////////////////////////////////////////////////////
 
-class AccessRecord {
-   public:
-    uint64_t taskID;
-    uint32_t epoch;
-    int32_t ref;
-    ADDRINT ip;
-
-   public:
-    AccessRecord() : AccessRecord(NULL_ID, START_EPOCH, 0) {}
-    AccessRecord(uint64_t taskID, uint32_t epoch, ADDRINT ip)
-        : taskID(taskID), epoch(epoch), ref(0), ip(ip) {}
-    AccessRecord& operator=(const AccessRecord& other) {
-        this->taskID = other.taskID;
-        this->epoch = other.epoch;
-        this->ip = other.ip;
-        this->ref = 0;
-        return *this;
-    }
-    bool isEmpty() { return taskID == NULL_ID; }
-    void increaseRef() { ATOMIC::OPS::Increment(&ref, (int32_t)1); }
-    void decreaseRef() {
-        int oldVal = ATOMIC::OPS::Increment(&ref, (int32_t)-1);
-        if (oldVal == 1) {
-            delete this;
-        }
-    }
-
-    std::string getLocation() {
-        return getSourceInfo(ip);
-    }
-
-    virtual ~AccessRecord() {}
-};
-
 class ByteSM {
    private:
-    AccessRecord* write;
-    std::unordered_map<uint64_t, AccessRecord*> reads;
+    VC write;
+    VC reads;
     PIN_RWMUTEX rwLock;
 
    public:
-    ByteSM() : write(nullptr), reads() {
+    ByteSM() : write(), reads() {
         if (!PIN_RWMutexInit(&rwLock)) {
             cerr << "Fail to initialize RW lock" << std::endl;
             PIN_ExitProcess(1);
         }
     }
     virtual ~ByteSM() {
-        write->decreaseRef();
-        for (auto it = reads.begin(), ie = reads.end(); it != ie; it++) {
-            it->second->decreaseRef();
-        }
         PIN_RWMutexFini(&rwLock);
     }
-    bool hasRead() { return !reads.empty(); }
-    bool hasWrite() { return write != nullptr; }
-    void updateWrite(AccessRecord* other) {
+    bool hasRead() { return !reads.isEmpty(); }
+    bool hasWrite() { return !write.isEmpty(); }
+    void updateWrite(uint64_t taskID, uint64_t taskEpoch) {
         PIN_RWMutexWriteLock(&rwLock);
-        if (this->write) {
-            this->write->decreaseRef();
-        }
-        this->write = other;
-        for (auto it = reads.begin(), ie = reads.end(); it != ie; it++) {
-            it->second->decreaseRef();
-        }
-        this->reads.clear();
+        write.update(taskID, taskEpoch, true);
+        reads.clear();
         PIN_RWMutexUnlock(&rwLock);
-        other->increaseRef();
+
     }
-    void updateRead(AccessRecord* other) {
+    void updateRead(uint64_t taskID, uint64_t taskEpoch) {
         PIN_RWMutexWriteLock(&rwLock);
-        auto it = reads.find(other->taskID);
-        if (it == reads.end()) {
-            reads.insert(std::make_pair(other->taskID, other));
-        } else {
-            it->second->decreaseRef();
-            it->second = other;
-        }
+        reads.update(taskID, taskEpoch, false);
         PIN_RWMutexUnlock(&rwLock);
-        other->increaseRef();
     }
-    std::unordered_map<uint64_t, AccessRecord*>& getReads() { return reads; }
-    AccessRecord* getWrite() { return write; }
+    VC& getReads() { return reads; }
+    VC& getWrite() { return write; }
     void readLock() { PIN_RWMutexReadLock(&rwLock); }
     void readUnlock() { PIN_RWMutexUnlock(&rwLock); }
     friend void recordMemRead(THREADID tid, void* addr, uint32_t size,
@@ -746,7 +886,6 @@ class ByteSM {
     friend void recordMemWrite(THREADID tid, void* addr, uint32_t size,
                                ADDRINT sp, ADDRINT ip);
 };
-
 class DataBlockSM {
    private:
     uintptr_t startAddress;
@@ -759,18 +898,18 @@ class DataBlockSM {
         byteArray = new ByteSM[length]();
     }
     virtual ~DataBlockSM() {}
-    void update(uintptr_t address, unsigned size, AccessRecord* ar,
+    void update(uintptr_t address, unsigned size, uint64_t taskID, uint64_t taskEpoch,
                 bool isRead) {
         // cout << (isRead ? "read" : "write") << endl;
         uint64_t offset = address - startAddress;
         assert(offset >= 0 && offset < length);
         if (isRead) {
             for (unsigned i = 0; i < size; i++) {
-                byteArray[offset + i].updateRead(ar);
+                byteArray[offset + i].updateRead(taskID, taskEpoch);
             }
         } else {
             for (unsigned i = 0; i < size; i++) {
-                byteArray[offset + i].updateWrite(ar);
+                byteArray[offset + i].updateWrite(taskID, taskEpoch);
             }
         }
     }
@@ -935,6 +1074,18 @@ void preEdt(THREADID tid, ocrGuid_t edtGuid, uint32_t paramc, uint64_t* paramv,
     tls->increaseEpoch();
     Node* task = computationGraph.getNode(taskID);
     task->calculateDepth();
+
+    VC* taskVC = vcMap.get(taskID);
+    for (auto ei = task->incomingEdges.begin(), ee = task->incomingEdges.end(); ei != ee; ++ei) {
+        Dep* dep = (*ei).second;
+        VC* prevVC = vcMap.get(dep->src->id);
+        if (!prevVC->isMerged()) {
+            prevVC->selfMerge();
+        }
+        taskVC->merge(*prevVC);
+    }
+    taskVC->setMerged(true);
+    taskVC->increment();
 #ifdef DEBUG
     *out << "preEdt finish" << std::endl;
 #endif
@@ -979,6 +1130,16 @@ void afterEdtCreate(THREADID tid, ocrGuid_t guid, ocrGuid_t templateGuid,
         Dep dep(task);
         associatedEvent->addDeps(taskID, dep);
     }
+    VC* vc = nullptr;
+    if (!isNullGuid(parent)) {
+        uint64_t parentID = guidMap.get(parent.guid);
+        VC* parentVC = vcMap.get(parentID);
+        vc = new VC(*parentVC, taskID);
+        parentVC->increment();
+    } else {
+        vc = new VC(taskID);
+    }
+    vcMap.put(taskID, vc);
 #ifdef DEBUG
     *out << "afterEdtCreate finish" << std::endl;
 #endif
@@ -1009,6 +1170,8 @@ void afterEventCreate(ocrGuid_t guid, ocrEventTypes_t eventType,
     guidMap.put(guid.guid, eventID);
     Event* event = new Event(eventID);
     computationGraph.insert(eventID, event);
+    VC* vc = new VC(eventID);
+    vcMap.put(eventID, vc);
 #ifdef DEBUG
     *out << "afterEventCreate finish" << std::endl;
 #endif
@@ -1034,17 +1197,17 @@ void afterAddDependence(THREADID tid, ocrGuid_t source, ocrGuid_t destination, u
         }
         
         //data dependence
-        if (srcID == NULL_ID && dstID != NULL_ID) {
-            Node* dst = computationGraph.getNode(dstID);
-            ThreadLocalStore* tls = static_cast<ThreadLocalStore*>(PIN_GetThreadData(tls_key, tid));
+        //if (srcID == NULL_ID && dstID != NULL_ID) {
+            //Node* dst = computationGraph.getNode(dstID);
+            //ThreadLocalStore* tls = static_cast<ThreadLocalStore*>(PIN_GetThreadData(tls_key, tid));
             //bugs----between two tasks executing on the same thread continuously, there can be other code snippet executing in the thread
-            if (tls->getTaskID() != NULL_ID) {
-                Node* current = computationGraph.getNode(tls->getTaskID());
-                Dep dep(current, tls->getEpoch());
-                tls->increaseEpoch();
-                dst->addDeps(tls->getTaskID(), dep);
-            }
-        }
+            //if (tls->getTaskID() != NULL_ID) {
+                //Node* current = computationGraph.getNode(tls->getTaskID());
+                //Dep dep(current, tls->getEpoch());
+                //tls->increaseEpoch();
+                //dst->addDeps(tls->getTaskID(), dep);
+            //}
+        //}
     }
 #ifdef DEBUG
     *out << "afterAddDependence finish" << std::endl;
@@ -1080,15 +1243,27 @@ void afterEventSatisfy(THREADID tid, ocrGuid_t edtGuid, ocrGuid_t eventGuid,
 #endif
 }
 
-//void afterEventPropagate(ocrGuid_t eventGuid) {
-//#ifdef DEBUG
- //*out << "afterEventPropagate" << std::endl;
-//#endif
-//
-//#ifdef DEBUG
- //*out << "afterEventPropagate finish" << std::endl;
-//#endif
-//}
+void afterEventPropagate(ocrGuid_t eventGuid) {
+#ifdef DEBUG
+ *out << "afterEventPropagate" << std::endl;
+#endif
+    uint64_t eventID = guidMap.get(eventGuid.guid);
+    Node* event = computationGraph.getNode(eventID);
+    VC* eventVC = vcMap.get(eventID);
+    for (auto ei = event->incomingEdges.begin(), ee = event->incomingEdges.end(); ei != ee; ++ei) {
+        Dep* dep = (*ei).second;
+        VC* prevVC = vcMap.get(dep->src->id);
+        if (!prevVC->isMerged()) {
+            prevVC->selfMerge();
+        }
+        eventVC->merge(*prevVC);
+    }
+    eventVC->setMerged(true);
+    //*out << "event " << eventID << "propogate\n";
+#ifdef DEBUG
+ *out << "afterEventPropagate finish" << std::endl;
+#endif
+}
 
 void afterEdtTerminate(THREADID tid, ocrGuid_t edtGuid) {
 #ifdef DEBUG
@@ -1368,19 +1543,19 @@ void overload(IMG img, void* v) {
         }
 
          // replace notifyEventPropagate
-         //rtn = RTN_FindByName(img, "notifyEventPropagate");
-         //if (RTN_Valid(rtn)) {
-        //#ifdef DEBUG
-        //*out << "replace notifyEventPropagate" << std::endl;
-        //#endif
-         //PROTO proto_notifyEventPropagate = PROTO_Allocate(
-         //PIN_PARG(void), CALLINGSTD_DEFAULT, "notifyEventPropagate",
-         //PIN_PARG_AGGREGATE(ocrGuid_t), PIN_PARG_END());
-         //RTN_ReplaceSignature(rtn, AFUNPTR(afterEventPropagate),
-         //IARG_PROTOTYPE, proto_notifyEventPropagate,
-         //IARG_FUNCARG_ENTRYPOINT_VALUE, 0, IARG_END);
-         //PROTO_Free(proto_notifyEventPropagate);
-        //}
+         rtn = RTN_FindByName(img, "notifyEventPropagate");
+         if (RTN_Valid(rtn)) {
+        #ifdef DEBUG
+        *out << "replace notifyEventPropagate" << std::endl;
+        #endif
+         PROTO proto_notifyEventPropagate = PROTO_Allocate(
+         PIN_PARG(void), CALLINGSTD_DEFAULT, "notifyEventPropagate",
+         PIN_PARG_AGGREGATE(ocrGuid_t), PIN_PARG_END());
+         RTN_ReplaceSignature(rtn, AFUNPTR(afterEventPropagate),
+         IARG_PROTOTYPE, proto_notifyEventPropagate,
+         IARG_FUNCARG_ENTRYPOINT_VALUE, 0, IARG_END);
+         PROTO_Free(proto_notifyEventPropagate);
+        }
 
         // replace notifyEdtTerminate
         rtn = RTN_FindByName(img, "notifyEdtTerminate");
@@ -1409,74 +1584,32 @@ void recordMemRead(THREADID tid, void* addr, uint32_t size, ADDRINT sp,
     ThreadLocalStore* tls =
         static_cast<ThreadLocalStore*>(PIN_GetThreadData(tls_key, tid));
     DataBlockSM* db = tls->getDB((uintptr_t)addr);
-    std::unordered_map<uint64_t, uint32_t> epochs;
-    std::set<AccessRecord*> ars;
-#ifdef OUTPUT_SOURCE
-    std::unordered_map<uint64_t, ADDRINT> ips;
-#endif
     if (db) {
+        VC* vc = vcMap.get(tls->getTaskID());
         uintptr_t offset = (uintptr_t)addr - db->startAddress;
         for (uintptr_t i = 0; i < size; i++) {
             ByteSM& byteSM = db->byteArray[offset + i];
             byteSM.readLock();
             if (byteSM.hasWrite()) {
-                AccessRecord* write = byteSM.getWrite();
-                if (ars.find(write) == ars.end()) {
-                    ars.insert(write);
-                    auto it = epochs.find(write->taskID);
-                    if (it == epochs.end()) {
-                        epochs.insert(
-                            std::make_pair(write->taskID, write->epoch));
-#ifdef OUTPUT_SOURCE
-                        ips.insert(std::make_pair(write->taskID, write->ip));
-#endif
-                    } else if (write->epoch > it->second) {
-                        it->second = write->epoch;
-#ifdef OUTPUT_SOURCE
-                        ips[write->taskID] = write->ip;
-#endif
+                if (!(byteSM.getWrite() <= *vc)) {
+                    *out << "write read race" << std::endl;
+                    *out << byteSM.getWrite().toString() << std::endl;
+                    //*out << vc->taskID << " " << vc->toString() << std::endl;
+                    *out << vc->taskID << std::endl;
+                    for (auto vi = vcMap.begin(), ve = vcMap.end(); vi != ve; ++vi) {
+                        VC* v = (*vi).second;
+                        *out << v->taskID << " " << v->toString() << std::endl;
                     }
+                    std::ofstream cg;
+                    cg.open("cg.dot"); 
+                    computationGraph.toDot(cg);
+                    cg.close();
+                    PIN_ExitProcess(1);
                 }
             }
             byteSM.readUnlock();
         }
-
-        AccessRecord* ar = new AccessRecord(tls->taskID, tls->taskEpoch, ip);
-        db->update((uintptr_t)addr, size, ar, true);
-#ifdef DETECT_RACE
-        // if (epochs.size() == 1) {
-        // auto ei = epochs.begin();
-        // if (!computationGraph.isReachable(ei->first, ei->second, tls->taskID,
-        // tls->taskEpoch)) { *out << "read-write race" << std::endl;
-        // PIN_ExitProcess(1);
-        //}
-        //} else {
-        // if (!computationGraph.isReachable(epochs, tls->taskID,
-        // tls->taskEpoch)) { *out << "read-write race" << std::endl;
-        // PIN_ExitProcess(1);
-        //}
-        //}
-        for (auto ei = epochs.begin(), ee = epochs.end(); ei != ee; ei++) {
-            if (!computationGraph.isReachable(ei->first, ei->second,
-                                              tls->taskID, tls->taskEpoch)) {
-                *out << "write-read race" << std::endl;
-                *out << ei->first << "#" << ei->second << " is conflict with "
-                     << tls->taskID << "#" << tls->taskEpoch << std::endl;
-#ifdef OUTPUT_SOURCE
-                *out << "write: " << getSourceInfo(ips[ei->first]) << std::endl; 
-                *out << "read:  " << getSourceInfo(ip) << std::endl;
-#endif
-
-#ifdef OUTPUT_CG
-                 ofstream dotFile;
-                 dotFile.open("cg.dot");
-                 computationGraph.toDot(dotFile);
-                 dotFile.close();
-#endif
-                PIN_ExitProcess(1);
-            }
-        }
-#endif
+        db->update((uintptr_t)addr, size, tls->getTaskID(), vc->getOwnClock(), true);
     }
 }
 
@@ -1485,100 +1618,28 @@ void recordMemWrite(THREADID tid, void* addr, uint32_t size, ADDRINT sp,
     ThreadLocalStore* tls =
         static_cast<ThreadLocalStore*>(PIN_GetThreadData(tls_key, tid));
     DataBlockSM* db = tls->getDB((uintptr_t)addr);
-    std::unordered_map<uint64_t, uint32_t> epochs;
-    std::set<AccessRecord*> ars;
-#ifdef OUTPUT_SOURCE
-    std::unordered_map<uint64_t, ADDRINT> ips;
-#endif
     if (db) {
+        VC* vc = vcMap.get(tls->getTaskID());
         uintptr_t offset = (uintptr_t)addr - db->startAddress;
         for (uintptr_t i = 0; i < size; i++) {
             ByteSM& byteSM = db->byteArray[offset + i];
             byteSM.readLock();
             if (byteSM.hasWrite()) {
-                AccessRecord* write = byteSM.getWrite();
-                if (ars.find(write) == ars.end()) {
-                    ars.insert(write);
-                    auto it = epochs.find(write->taskID);
-                    if (it == epochs.end()) {
-                        epochs.insert(
-                            std::make_pair(write->taskID, write->epoch));
-#ifdef OUTPUT_SOURCE
-                        ips.insert(std::make_pair(write->taskID, write->ip));
-#endif
-                    } else if (write->epoch > it->second) {
-                        it->second = write->epoch;
-#ifdef OUTPUT_SOURCE
-                        ips[write->taskID] = write->ip;
-#endif
-                    }
+                if (!(byteSM.getWrite() <= *vc)) {
+                    *out << "write write race" << std::endl;
+                    PIN_ExitProcess(1);
                 }
             }
             if (byteSM.hasRead()) {
-                for (auto rt = byteSM.getReads().begin(),
-                          re = byteSM.getReads().end();
-                     rt != re; ++rt) {
-                    AccessRecord* read = rt->second;
-                    if (ars.find(read) == ars.end()) {
-                        ars.insert(read);
-                        auto it = epochs.find(read->taskID);
-                        if (it == epochs.end()) {
-                            epochs.insert(
-                                std::make_pair(read->taskID, read->epoch));
-#ifdef OUTPUT_SOURCE
-                            ips.insert(std::make_pair(read->taskID, read->ip));
-#endif
-                        } else if (read->epoch > it->second) {
-                            it->second = read->epoch;
-#ifdef OUTPUT_SOURCE
-                            ips[read->taskID] = read->ip;
-#endif
-                        }
-                    }
+                if (!(byteSM.getReads() <= *vc)) {
+                    *out << "read write race" << std::endl;
+                    PIN_ExitProcess(1);
                 }
             }
             byteSM.readUnlock();
         }
 
-        AccessRecord* ar = new AccessRecord(tls->taskID, tls->taskEpoch, ip);
-        db->update(uintptr_t(addr), size, ar, false);
-
-#ifdef DETECT_RACE
-        // if (epochs.size() == 1) {
-        // auto ei = epochs.begin();
-        // if (!computationGraph.isReachable(ei->first, ei->second,
-        // tls->taskID, tls->taskEpoch)) {
-        //*out << "write race" << std::endl;
-        // PIN_ExitProcess(1);
-        //}
-        //} else {
-        // if (!computationGraph.isReachable(epochs, tls->taskID,
-        // tls->taskEpoch)) {
-        //*out << "write race" << std::endl;
-        // PIN_ExitProcess(1);
-        //}
-        //}
-        for (auto ei = epochs.begin(), ee = epochs.end(); ei != ee; ei++) {
-            if (!computationGraph.isReachable(ei->first, ei->second,
-                                              tls->taskID, tls->taskEpoch)) {
-                *out << "write race" << std::endl;
-                *out << ei->first << "#" << ei->second << " is conflict with "
-                     << tls->taskID << "#" << tls->taskEpoch << std::endl;
-#ifdef OUTPUT_SOURCE
-                *out << "previous: " << getSourceInfo(ips[ei->first]) << std::endl; 
-                *out << "write:  " << getSourceInfo(ip) << std::endl;
-#endif
-
-#ifdef OUTPUT_CG
-                 ofstream dotFile;
-                 dotFile.open("cg.dot");
-                 computationGraph.toDot(dotFile);
-                 dotFile.close();
-#endif
-                PIN_ExitProcess(1);
-            }
-        }
-#endif
+        db->update(uintptr_t(addr), size, tls->getTaskID(), vc->getOwnClock(), false);
     }
 }
 
