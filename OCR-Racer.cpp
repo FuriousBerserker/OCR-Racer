@@ -31,6 +31,7 @@
 //#define STATISTICS
 //#define OUTPUT_CG
 //#define OUTPUT_SOURCE
+#define COUNT_OPS
 
 
 class Node;
@@ -40,6 +41,12 @@ class ComputationMap;
 
 #ifdef MEASURE_TIME
 struct timeval program_start, program_end;
+#endif
+
+#ifdef COUNT_OPS
+uint64_t comparison = 0;
+uint64_t unique_graph_traversal = 0;
+uint64_t overall_steps = 0;
 #endif
 
 const uint32_t NULL_ID = 0;
@@ -355,6 +362,16 @@ bool ComputationGraph::isReachable(uint64_t srcID, uint32_t srcEpoch,
     }
     Node* dstNode = nodeMap.get(dstID);
     bool result = false;
+    uint64_t cacheKey = generateCacheKey(srcID, dstID);
+    uint32_t cacheEpoch = cacheMap.get(cacheKey);
+#ifdef COUNT_OPS
+    if (cacheEpoch >= srcEpoch) {
+        return true;
+    } else {
+        ATOMIC::OPS::Increment(&unique_graph_traversal, (uint64_t)1);
+    }
+    uint64_t local_steps = 1;
+#endif
     std::queue<Node*> q;
     std::set<uint64_t> accessedNodes;
     q.push(dstNode);
@@ -384,6 +401,9 @@ bool ComputationGraph::isReachable(uint64_t srcID, uint32_t srcEpoch,
                     accessedNodes.end()) {
                     accessedNodes.insert(next->parent->id);
                     q.push(next->parent);
+#ifdef COUNT_OPS
+                    local_steps += 1;
+#endif
                 }
             }
             for (auto it = next->incomingEdges.begin(),
@@ -398,6 +418,9 @@ bool ComputationGraph::isReachable(uint64_t srcID, uint32_t srcEpoch,
                         ancestor->incomingEdges.getSize() == 1) ||
                        (ancestor->type == Node::TASK &&
                         ancestor->incomingEdges.getSize() == 0)) {
+#ifdef COUNT_OPS
+                    local_steps += 1;
+#endif
                     uint32_t ancestorEpoch;
                     if (ancestor->type == Node::EVENT) {
                         auto it = ancestor->incomingEdges.begin();
@@ -414,6 +437,9 @@ bool ComputationGraph::isReachable(uint64_t srcID, uint32_t srcEpoch,
                         if (ancestorEpoch >= srcEpoch) {
                             result = true;
                             updateCache(srcID, srcEpoch, dstID);
+#ifdef COUNT_OPS
+                    ATOMIC::OPS::Increment(&overall_steps, local_steps);
+#endif
                             return result;
                         } else {
                             break;
@@ -424,6 +450,10 @@ bool ComputationGraph::isReachable(uint64_t srcID, uint32_t srcEpoch,
                     accessedNodes.find(ancestor->id) == accessedNodes.end()) {
                     accessedNodes.insert(ancestor->id);
                     q.push(ancestor);
+#ifdef COUNT_OPS
+                    local_steps += 1;
+#endif
+
                 }
             }
         }
@@ -432,6 +462,10 @@ bool ComputationGraph::isReachable(uint64_t srcID, uint32_t srcEpoch,
     if (result) {
         updateCache(srcID, srcEpoch, dstID);
     }
+#ifdef COUNT_OPS
+    ATOMIC::OPS::Increment(&overall_steps, local_steps);
+#endif
+
     return result;
 }
 
@@ -1137,6 +1171,12 @@ void fini(int32_t code, void* v) {
 #ifdef STATISTICS
     computationGraph.showStatistics(*out);
 #endif
+
+#ifdef COUNT_OPS
+    *out << "comparison: " << ATOMIC::OPS::Load(&comparison) << std::endl;
+    *out << "unique_comparison: " << ATOMIC::OPS::Load(&unique_graph_traversal) << std::endl;
+    *out << "overall_steps: " << ATOMIC::OPS::Load(&overall_steps) << std::endl;
+#endif
     // errorFile.close();
     // logFile.close();
 }
@@ -1387,6 +1427,10 @@ void recordMemRead(THREADID tid, void* addr, uint32_t size, ADDRINT sp,
             byteSM.readLock();
             if (byteSM.hasWrite()) {
                 AccessRecord* write = byteSM.getWrite();
+#ifdef COUNT_OPS
+       ATOMIC::OPS::Increment(&comparison, (uint64_t)1); 
+#endif
+
                 if (ars.find(write) == ars.end()) {
                     ars.insert(write);
                     auto it = epochs.find(write->taskID);
@@ -1463,6 +1507,9 @@ void recordMemWrite(THREADID tid, void* addr, uint32_t size, ADDRINT sp,
             byteSM.readLock();
             if (byteSM.hasWrite()) {
                 AccessRecord* write = byteSM.getWrite();
+#ifdef COUNT_OPS
+       ATOMIC::OPS::Increment(&comparison, (uint64_t)1); 
+#endif
                 if (ars.find(write) == ars.end()) {
                     ars.insert(write);
                     auto it = epochs.find(write->taskID);
@@ -1481,6 +1528,9 @@ void recordMemWrite(THREADID tid, void* addr, uint32_t size, ADDRINT sp,
                 }
             }
             if (byteSM.hasRead()) {
+#ifdef COUNT_OPS
+       ATOMIC::OPS::Increment(&comparison, (uint64_t)(byteSM.getReads().size())); 
+#endif
                 for (auto rt = byteSM.getReads().begin(),
                           re = byteSM.getReads().end();
                      rt != re; ++rt) {
@@ -1524,6 +1574,7 @@ void recordMemWrite(THREADID tid, void* addr, uint32_t size, ADDRINT sp,
         // PIN_ExitProcess(1);
         //}
         //}
+
         for (auto ei = epochs.begin(), ee = epochs.end(); ei != ee; ei++) {
             if (!computationGraph.isReachable(ei->first, ei->second,
                                               tls->taskID, tls->taskEpoch)) {
