@@ -31,7 +31,7 @@
 //#define STATISTICS
 //#define OUTPUT_CG
 //#define OUTPUT_SOURCE
-#define COUNT_OPS
+//#define COUNT_OPS
 
 
 class Node;
@@ -362,9 +362,10 @@ bool ComputationGraph::isReachable(uint64_t srcID, uint32_t srcEpoch,
     }
     Node* dstNode = nodeMap.get(dstID);
     bool result = false;
+#ifdef COUNT_OPS
     uint64_t cacheKey = generateCacheKey(srcID, dstID);
     uint32_t cacheEpoch = cacheMap.get(cacheKey);
-#ifdef COUNT_OPS
+
     if (cacheEpoch >= srcEpoch) {
         return true;
     } else {
@@ -992,9 +993,9 @@ void afterDbCreate(THREADID tid, ocrGuid_t guid, void* addr, uint64_t len,
     DataBlockSM* newDB = new DataBlockSM((uintptr_t)addr, len);
     sm.insertDB(guid.guid, newDB);
     // new created DB is acquired by current EDT instantly
-    //ThreadLocalStore* tls =
-        //static_cast<ThreadLocalStore*>(PIN_GetThreadData(tls_key, tid));
-    //tls->insertDB(newDB);
+    ThreadLocalStore* tls =
+        static_cast<ThreadLocalStore*>(PIN_GetThreadData(tls_key, tid));
+    tls->insertDB(newDB);
 #ifdef DEBUG
     cout << "afterDbCreate finish" << std::endl;
 #endif
