@@ -31,7 +31,7 @@
 //#define STATISTICS
 #define OUTPUT_CG
 //#define OUTPUT_SOURCE
-
+#define COUNT_OPS
 
 class Node;
 class Task;
@@ -42,6 +42,14 @@ class ComputationMap;
 struct timeval program_start, program_end;
 #endif
 
+#ifdef COUNT_OPS
+uint64_t epoch_comparison = 0;
+uint64_t vc_comparison = 0;
+uint64_t vc_length = 0;
+uint64_t merge_num = 0;
+uint64_t vc_merge_length = 0;
+uint64_t self_merge_num = 0;
+#endif
 const uint32_t NULL_ID = 0;
 
 const uint32_t START_EPOCH = 0;
@@ -724,6 +732,10 @@ void VC::merge(const VC& vc) {
             clockMap[ci->first] = ci->second;
         }
     }
+#ifdef COUNT_OPS
+    ATOMIC::OPS::Increment(&merge_num, (uint64_t)1);
+    ATOMIC::OPS::Increment(&vc_merge_length, (uint64_t)(vc.clockMap.size()));
+#endif
 }
 
 void VC::update(uint64_t taskID, uint64_t epoch, bool isOverride) {
@@ -808,6 +820,9 @@ void VC::selfMerge() {
         }
     }
     merged = true;
+#ifdef COUNT_OPS
+    ATOMIC::OPS::Increment(&self_merge_num, (uint64_t)1);
+#endif
 }
 
 inline bool VC::isMerged() const {
@@ -824,11 +839,18 @@ inline bool operator<=(const VC& vc1, const VC& vc2) {
     //    cout << vc2.toString() << endl;
     bool result = true;
     if (vc1.isEpoch()) {
+#ifdef COUNT_OPS
+    ATOMIC::OPS::Increment(&epoch_comparison, (uint64_t)1);
+#endif
         auto ci2 = vc2.clockMap.find(vc1.taskID);
         if (ci2 == vc2.clockMap.end() || ci2->second < vc1.epoch) {
             result = false;
         }
     } else {
+#ifdef COUNT_OPS
+    ATOMIC::OPS::Increment(&vc_comparison, (uint64_t)1);
+    ATOMIC::OPS::Increment(&vc_length, (uint64_t)(vc1.clockMap.size()));
+#endif
         for (auto ci = vc1.clockMap.begin(), ce = vc1.clockMap.end(); ci != ce; ci++) {
             auto ci2 = vc2.clockMap.find(ci->first);
             if (ci2 == vc2.clockMap.end() || ci2->second < ci->second) {
@@ -1345,6 +1367,15 @@ void fini(int32_t code, void* v) {
 
 #ifdef STATISTICS
     computationGraph.showStatistics(*out);
+#endif
+
+#ifdef COUNT_OPS
+    *out << "epoch_comparison: " << ATOMIC::OPS::Load(&epoch_comparison) << std::endl;
+    *out << "vc_comparison: " << ATOMIC::OPS::Load(&vc_comparison) << std::endl;
+    *out << "vc_length: " << ATOMIC::OPS::Load(&vc_length) << std::endl;
+    *out << "merge_num: " << ATOMIC::OPS::Load(&merge_num) << std::endl;
+    *out << "vc_merge_length: " << ATOMIC::OPS::Load(&vc_merge_length) << std::endl;
+    *out << "self_merge_num: " << ATOMIC::OPS::Load(&self_merge_num) << std::endl;
 #endif
     // errorFile.close();
     // logFile.close();
