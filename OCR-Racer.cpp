@@ -1175,9 +1175,9 @@ void afterDbCreate(THREADID tid, ocrGuid_t guid, void* addr, uint64_t len,
     DataBlockSM* newDB = new DataBlockSM((uintptr_t)addr, len);
     sm.insertDB(guid.guid, newDB);
     // new created DB is acquired by current EDT instantly
-    //ThreadLocalStore* tls =
-        //static_cast<ThreadLocalStore*>(PIN_GetThreadData(tls_key, tid));
-    //tls->insertDB(newDB);
+    ThreadLocalStore* tls =
+        static_cast<ThreadLocalStore*>(PIN_GetThreadData(tls_key, tid));
+    tls->insertDB(newDB);
 #ifdef DEBUG
     cout << "afterDbCreate finish" << std::endl;
 #endif
@@ -1624,17 +1624,17 @@ void recordMemRead(THREADID tid, void* addr, uint32_t size, ADDRINT sp,
             if (byteSM.hasWrite()) {
                 if (!(byteSM.getWrite() <= *vc)) {
                     *out << "write read race" << std::endl;
-                    *out << byteSM.getWrite().toString() << std::endl;
+                    //*out << byteSM.getWrite().toString() << std::endl;
                     //*out << vc->taskID << " " << vc->toString() << std::endl;
-                    *out << vc->taskID << std::endl;
-                    for (auto vi = vcMap.begin(), ve = vcMap.end(); vi != ve; ++vi) {
-                        VC* v = (*vi).second;
-                        *out << v->taskID << " " << v->toString() << std::endl;
-                    }
-                    std::ofstream cg;
-                    cg.open("cg.dot"); 
-                    computationGraph.toDot(cg);
-                    cg.close();
+                    //*out << vc->taskID << std::endl;
+                    //for (auto vi = vcMap.begin(), ve = vcMap.end(); vi != ve; ++vi) {
+                        //VC* v = (*vi).second;
+                        //*out << v->taskID << " " << v->toString() << std::endl;
+                    //}
+                    //std::ofstream cg;
+                    //cg.open("cg.dot"); 
+                    //computationGraph.toDot(cg);
+                    //cg.close();
                     PIN_ExitProcess(1);
                 }
             }
