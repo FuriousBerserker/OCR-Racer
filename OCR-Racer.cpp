@@ -24,14 +24,13 @@
 #include "ocr-types.h"
 
 //#define DEBUG
-//#define GRAPH_CONSTRUCTION
-//#define INSTRUMENT
-//#define DETECT_RACE
-//#define MEASURE_TIME
+#define GRAPH_CONSTRUCTION
+#define INSTRUMENT
+#define DETECT_RACE
+#define MEASURE_TIME
 //#define STATISTICS
-//#define OUTPUT_CG
+#define OUTPUT_CG
 //#define OUTPUT_SOURCE
-
 
 class Node;
 class Task;
@@ -49,6 +48,8 @@ const uint32_t END_EPOCH = 0xFFFFFFFF;
 
 uint32_t nextTaskID = 1;
 
+uint64_t self_calculate_depth = 0;
+uint64_t self_calculate_depth_time = 0;
 // guid ---> task ID map
 ConcurrentHashMap<uint64_t, uint64_t, NULL_ID, IdentityHash<uint64_t> > guidMap(
     10000);
@@ -222,7 +223,7 @@ class Node {
     enum Type { TASK, DB, EVENT };
     enum EdgeType { SPAWN, JOIN, CONTINUE };
 
-   protected:
+   public:
     ConcurrentHashMap<uint64_t, Dep*, nullptr, IdentityHash<uint64_t> >
         incomingEdges;
     Task* parent;
@@ -279,6 +280,8 @@ class ComputationGraph {
     Node* getNode(uint64_t key);
     bool isReachable(uint64_t srcID, uint32_t srcEpoch, uint64_t dstID,
                      uint32_t dstEpoch);
+    bool isReachable2(uint64_t srcID, uint32_t srcEpoch, uint64_t dstID,
+                      uint32_t dstEpoch);
     bool isReachable(std::unordered_map<uint64_t, uint32_t>& srcNodes,
                      uint64_t dstID, uint32_t dstEpoch);
     void updateCache(uint64_t srcID, uint32_t srcEpoch, uint64_t dstID);
@@ -312,30 +315,43 @@ Node::~Node() {}
 inline void Node::addDeps(uint64_t id, Dep& dep) {
     Dep* copy = new Dep(dep);
     incomingEdges.put(id, copy);
-    //*out << id << "#" << dep.epoch << "->" << this->id << std::endl;
+    assert(depth == 0);
 }
 
 inline void Node::calculateDepth() {
-    for (auto ei = incomingEdges.begin(), ee = incomingEdges.end(); ei != ee; ++ei) {
+//  to avoid race
+    uint64_t internal_depth = 0;
+    for (auto ei = incomingEdges.begin(), ee = incomingEdges.end(); ei != ee;
+         ++ei) {
         Node* prev = (*ei).second->src;
         uint64_t prevDepth = prev->getDepth();
-        if (depth < prevDepth) {
-            depth = prevDepth;
+        //*out << prev->id << " # " << prevDepth << " -> " << id << std::endl;
+        if (internal_depth < prevDepth) {
+            internal_depth = prevDepth;
         }
     }
 
     if (parent) {
         uint64_t parentDepth = parent->getDepth();
-        if (depth < parentDepth) {
-            depth = parentDepth;
+        if (internal_depth < parentDepth) {
+            internal_depth = parentDepth;
         }
     }
-    depth += 1;
+    internal_depth += 1;
+    depth = internal_depth;
 }
 
 inline uint64_t Node::getDepth() {
     if (depth == 0) {
+        struct timeval depth_start, depth_end;
+        gettimeofday(&depth_start, nullptr);
         calculateDepth();
+        gettimeofday(&depth_end, nullptr);
+        ATOMIC::OPS::Increment(&self_calculate_depth, (uint64_t)1);
+        time_t depth_span = (depth_end.tv_sec - depth_start.tv_sec) * 1000000 +
+                       (depth_end.tv_usec - depth_start.tv_usec);
+        ATOMIC::OPS::Increment(&self_calculate_depth_time, (uint64_t)depth_span);
+
     }
     return depth;
 }
@@ -408,7 +424,8 @@ bool ComputationGraph::isReachable(uint64_t srcID, uint32_t srcEpoch,
                 result = true;
                 break;
             }
-            if (next->parent && next->parent->id != srcID && next->parent->getDepth() > srcNode->getDepth()) {
+            if (next->parent && next->parent->id != srcID &&
+                next->parent->getDepth() > srcNode->getDepth()) {
                 if (accessedNodes.find(next->parent->id) ==
                     accessedNodes.end()) {
                     accessedNodes.insert(next->parent->id);
@@ -457,6 +474,61 @@ bool ComputationGraph::isReachable(uint64_t srcID, uint32_t srcEpoch,
                     accessedNodes.insert(ancestor->id);
                     q.push(ancestor);
                 }
+            }
+        }
+    }
+
+    if (result) {
+        updateCache(srcID, srcEpoch, dstID);
+    }
+    return result;
+}
+
+// A BFS search to check the reachability between nodes
+bool ComputationGraph::isReachable2(uint64_t srcID, uint32_t srcEpoch,
+                                    uint64_t dstID, uint32_t dstEpoch) {
+    if (srcID == dstID) {
+        return true;
+    }
+    Node* dstNode = nodeMap.get(dstID);
+    bool result = false;
+    std::queue<Node*> q;
+    std::set<uint64_t> accessedNodes;
+    q.push(dstNode);
+    accessedNodes.insert(dstID);
+    while (!q.empty()) {
+        Node* next = q.front();
+        q.pop();
+        Dep* search = next->incomingEdges.get(srcID);
+        if (search && search->epoch >= srcEpoch) {
+            result = true;
+            break;
+        }
+        if (next->parent && next->parent->id == srcID &&
+            next->parentEpoch >= srcEpoch) {
+            result = true;
+            break;
+        }
+        if (next->parent && next->parent->id != srcID) {
+            if (accessedNodes.find(next->parent->id) == accessedNodes.end()) {
+                accessedNodes.insert(next->parent->id);
+                q.push(next->parent);
+                *out << next->id << " -> " << next->parent->id << std::endl;
+            }
+        }
+        for (auto it = next->incomingEdges.begin(),
+                  ie = next->incomingEdges.end();
+             it != ie; ++it) {
+            Node* ancestor = (*it).second->src;
+            assert(ancestor);
+            if (ancestor->id == srcID) {
+                continue;
+            }
+            if (ancestor && ancestor->id != srcID &&
+                accessedNodes.find(ancestor->id) == accessedNodes.end()) {
+                accessedNodes.insert(ancestor->id);
+                q.push(ancestor);
+                *out << next->id << " -> " << ancestor->id << std::endl;
             }
         }
     }
@@ -558,11 +630,12 @@ void ComputationGraph::toDot(std::ostream& out) {
         if (node->type == Node::TASK) {
             uint32_t finalEpoch = epochMap.get(node->id);
             for (uint32_t i = START_EPOCH + 1; i <= finalEpoch; i++) {
-                out << '\"' << node->id << "#" << i << '\"' << nodeColor << ";"
-                    << std::endl;
+                out << '\"' << node->id << "#" << node->depth << "#" << i
+                    << '\"' << nodeColor << ";" << std::endl;
             }
         } else {
-            out << '\"' << node->id << '\"' << nodeColor << ";" << std::endl;
+            out << '\"' << node->id << "#" << node->depth << '\"' << nodeColor
+                << ";" << std::endl;
         }
     }
 
@@ -584,10 +657,8 @@ void ComputationGraph::toDot(std::ostream& out) {
                       de = node->incomingEdges.end();
                  di != de; ++di) {
                 Dep* dep = (*di).second;
-                outputLink(out, dep->src,
-                           (dep->epoch == END_EPOCH ? epochMap.get(dep->src->id)
-                                                    : dep->epoch),
-                           node, START_EPOCH + 1, Node::JOIN);
+                outputLink(out, dep->src, (dep->epoch), node, START_EPOCH + 1,
+                           Node::JOIN);
             }
             uint32_t finalEpoch = epochMap.get(node->id);
             for (uint32_t i = START_EPOCH + 1; i < finalEpoch; i++) {
@@ -598,10 +669,8 @@ void ComputationGraph::toDot(std::ostream& out) {
                       de = node->incomingEdges.end();
                  di != de; ++di) {
                 Dep* dep = (*di).second;
-                outputLink(out, dep->src,
-                           (dep->epoch == END_EPOCH ? epochMap.get(dep->src->id)
-                                                    : dep->epoch),
-                           node, START_EPOCH + 1, Node::JOIN);
+                outputLink(out, dep->src, (dep->epoch), node, START_EPOCH + 1,
+                           Node::JOIN);
             }
         }
     }
@@ -611,13 +680,13 @@ void ComputationGraph::toDot(std::ostream& out) {
 void ComputationGraph::outputLink(std::ostream& out, Node* n1, uint32_t epoch1,
                                   Node* n2, uint32_t epoch2,
                                   Node::EdgeType edgeType) {
-    out << '\"' << n1->id;
+    out << '\"' << n1->id << "#" << n1->depth;
     if (n1->type == Node::TASK) {
         out << '#' << epoch1;
     }
     out << '\"';
     out << " -> ";
-    out << '\"' << n2->id;
+    out << '\"' << n2->id << "#" << n2->depth;
     if (n2->type == Node::TASK) {
         out << '#' << epoch2;
     }
@@ -627,11 +696,10 @@ void ComputationGraph::outputLink(std::ostream& out, Node* n1, uint32_t epoch1,
 }
 #endif
 
-
 #ifdef STATISTICS
 void ComputationGraph::showStatistics(std::ostream& out) {
-   uint64_t taskNum = 0, eventNum = 0, edgeNum = 0;
-   for (auto ni = nodeMap.begin(), ne = nodeMap.end(); ni != ne; ++ni) {
+    uint64_t taskNum = 0, eventNum = 0, edgeNum = 0;
+    for (auto ni = nodeMap.begin(), ne = nodeMap.end(); ni != ne; ++ni) {
         Node* node = (*ni).second;
         if (node->type == Node::TASK) {
             taskNum += 1;
@@ -643,10 +711,10 @@ void ComputationGraph::showStatistics(std::ostream& out) {
             eventNum += 1;
             edgeNum += node->incomingEdges.getSize();
         }
-   } 
-   out << "task: " << taskNum << std::endl;
-   out << "event: " << eventNum << std::endl;
-   out << "edge: " << edgeNum << std::endl;
+    }
+    out << "task: " << taskNum << std::endl;
+    out << "event: " << eventNum << std::endl;
+    out << "edge: " << edgeNum << std::endl;
 }
 #endif
 
@@ -683,9 +751,7 @@ class AccessRecord {
         }
     }
 
-    std::string getLocation() {
-        return getSourceInfo(ip);
-    }
+    std::string getLocation() { return getSourceInfo(ip); }
 
     virtual ~AccessRecord() {}
 };
@@ -824,7 +890,7 @@ class ThreadLocalStore {
     }
     void increaseEpoch() { this->taskEpoch++; }
     uint32_t getEpoch() { return this->taskEpoch; }
-    uint64_t getTaskID() {return this->taskID; }
+    uint64_t getTaskID() { return this->taskID; }
     void insertDB(DataBlockSM* db) {
         int offset;
         bool isContain = searchDB(db->startAddress, nullptr, &offset);
@@ -992,9 +1058,9 @@ void afterDbCreate(THREADID tid, ocrGuid_t guid, void* addr, uint64_t len,
     DataBlockSM* newDB = new DataBlockSM((uintptr_t)addr, len);
     sm.insertDB(guid.guid, newDB);
     // new created DB is acquired by current EDT instantly
-    //ThreadLocalStore* tls =
-        //static_cast<ThreadLocalStore*>(PIN_GetThreadData(tls_key, tid));
-    //tls->insertDB(newDB);
+    // ThreadLocalStore* tls =
+    // static_cast<ThreadLocalStore*>(PIN_GetThreadData(tls_key, tid));
+    // tls->insertDB(newDB);
 #ifdef DEBUG
     cout << "afterDbCreate finish" << std::endl;
 #endif
@@ -1014,8 +1080,8 @@ void afterEventCreate(ocrGuid_t guid, ocrEventTypes_t eventType,
 #endif
 }
 
-void afterAddDependence(THREADID tid, ocrGuid_t source, ocrGuid_t destination, uint32_t slot,
-                        ocrDbAccessMode_t mode) {
+void afterAddDependence(THREADID tid, ocrGuid_t source, ocrGuid_t destination,
+                        uint32_t slot, ocrDbAccessMode_t mode) {
 #ifdef DEBUG
     *out << "afterAddDependence" << std::endl;
 #endif
@@ -1032,12 +1098,15 @@ void afterAddDependence(THREADID tid, ocrGuid_t source, ocrGuid_t destination, u
             assert(src != nullptr);
             dst->addDeps(srcID, dep);
         }
-        
-        //data dependence
+
+        // data dependence
         if (srcID == NULL_ID && dstID != NULL_ID) {
             Node* dst = computationGraph.getNode(dstID);
-            ThreadLocalStore* tls = static_cast<ThreadLocalStore*>(PIN_GetThreadData(tls_key, tid));
-            //bugs----between two tasks executing on the same thread continuously, there can be other code snippet executing in the thread
+            ThreadLocalStore* tls =
+                static_cast<ThreadLocalStore*>(PIN_GetThreadData(tls_key, tid));
+            // bugs----between two tasks executing on the same thread
+            // continuously, there can be other code snippet executing in the
+            // thread
             if (tls->getTaskID() != NULL_ID) {
                 Node* current = computationGraph.getNode(tls->getTaskID());
                 Dep dep(current, tls->getEpoch());
@@ -1080,13 +1149,13 @@ void afterEventSatisfy(THREADID tid, ocrGuid_t edtGuid, ocrGuid_t eventGuid,
 #endif
 }
 
-//void afterEventPropagate(ocrGuid_t eventGuid) {
+// void afterEventPropagate(ocrGuid_t eventGuid) {
 //#ifdef DEBUG
- //*out << "afterEventPropagate" << std::endl;
+//*out << "afterEventPropagate" << std::endl;
 //#endif
 //
 //#ifdef DEBUG
- //*out << "afterEventPropagate finish" << std::endl;
+//*out << "afterEventPropagate finish" << std::endl;
 //#endif
 //}
 
@@ -1157,7 +1226,8 @@ void fini(int32_t code, void* v) {
 
 #ifdef MEASURE_TIME
     gettimeofday(&program_end, nullptr);
-    time_t time_span = (program_end.tv_sec - program_start.tv_sec) * 1000000 + (program_end.tv_usec - program_start.tv_usec);
+    time_t time_span = (program_end.tv_sec - program_start.tv_sec) * 1000000 +
+                       (program_end.tv_usec - program_start.tv_usec);
     *out << "elapsed time: " << time_span << " us" << std::endl;
 #endif
 
@@ -1171,6 +1241,8 @@ void fini(int32_t code, void* v) {
 #ifdef STATISTICS
     computationGraph.showStatistics(*out);
 #endif
+    *out << "self_calculate_dept: " << ATOMIC::OPS::Load(&self_calculate_depth) << std::endl;
+    *out << "self_calculate_depth_time: " << ATOMIC::OPS::Load(&self_calculate_depth_time) << std::endl;
     // errorFile.close();
     // logFile.close();
 }
@@ -1293,11 +1365,12 @@ void overload(IMG img, void* v) {
                 PIN_PARG_AGGREGATE(ocrGuid_t), PIN_PARG_AGGREGATE(ocrGuid_t),
                 PIN_PARG(uint32_t), PIN_PARG_ENUM(ocrDbAccessMode_t),
                 PIN_PARG_END());
-            RTN_ReplaceSignature(
-                rtn, AFUNPTR(afterAddDependence), IARG_PROTOTYPE,
-                proto_notifyAddDependence, IARG_THREAD_ID, IARG_FUNCARG_ENTRYPOINT_VALUE, 0,
-                IARG_FUNCARG_ENTRYPOINT_VALUE, 1, IARG_FUNCARG_ENTRYPOINT_VALUE,
-                2, IARG_FUNCARG_ENTRYPOINT_VALUE, 3, IARG_END);
+            RTN_ReplaceSignature(rtn, AFUNPTR(afterAddDependence),
+                                 IARG_PROTOTYPE, proto_notifyAddDependence,
+                                 IARG_THREAD_ID, IARG_FUNCARG_ENTRYPOINT_VALUE,
+                                 0, IARG_FUNCARG_ENTRYPOINT_VALUE, 1,
+                                 IARG_FUNCARG_ENTRYPOINT_VALUE, 2,
+                                 IARG_FUNCARG_ENTRYPOINT_VALUE, 3, IARG_END);
             PROTO_Free(proto_notifyAddDependence);
         }
 
@@ -1367,19 +1440,19 @@ void overload(IMG img, void* v) {
             PROTO_Free(proto_notifyDbRelease);
         }
 
-         // replace notifyEventPropagate
-         //rtn = RTN_FindByName(img, "notifyEventPropagate");
-         //if (RTN_Valid(rtn)) {
+        // replace notifyEventPropagate
+        // rtn = RTN_FindByName(img, "notifyEventPropagate");
+        // if (RTN_Valid(rtn)) {
         //#ifdef DEBUG
         //*out << "replace notifyEventPropagate" << std::endl;
         //#endif
-         //PROTO proto_notifyEventPropagate = PROTO_Allocate(
-         //PIN_PARG(void), CALLINGSTD_DEFAULT, "notifyEventPropagate",
-         //PIN_PARG_AGGREGATE(ocrGuid_t), PIN_PARG_END());
-         //RTN_ReplaceSignature(rtn, AFUNPTR(afterEventPropagate),
-         //IARG_PROTOTYPE, proto_notifyEventPropagate,
-         //IARG_FUNCARG_ENTRYPOINT_VALUE, 0, IARG_END);
-         //PROTO_Free(proto_notifyEventPropagate);
+        // PROTO proto_notifyEventPropagate = PROTO_Allocate(
+        // PIN_PARG(void), CALLINGSTD_DEFAULT, "notifyEventPropagate",
+        // PIN_PARG_AGGREGATE(ocrGuid_t), PIN_PARG_END());
+        // RTN_ReplaceSignature(rtn, AFUNPTR(afterEventPropagate),
+        // IARG_PROTOTYPE, proto_notifyEventPropagate,
+        // IARG_FUNCARG_ENTRYPOINT_VALUE, 0, IARG_END);
+        // PROTO_Free(proto_notifyEventPropagate);
         //}
 
         // replace notifyEdtTerminate
@@ -1463,16 +1536,21 @@ void recordMemRead(THREADID tid, void* addr, uint32_t size, ADDRINT sp,
                 *out << ei->first << "#" << ei->second << " is conflict with "
                      << tls->taskID << "#" << tls->taskEpoch << std::endl;
 #ifdef OUTPUT_SOURCE
-                *out << "write: " << getSourceInfo(ips[ei->first]) << std::endl; 
+                *out << "write: " << getSourceInfo(ips[ei->first]) << std::endl;
                 *out << "read:  " << getSourceInfo(ip) << std::endl;
 #endif
 
 #ifdef OUTPUT_CG
-                 ofstream dotFile;
-                 dotFile.open("cg.dot");
-                 computationGraph.toDot(dotFile);
-                 dotFile.close();
+                ofstream dotFile;
+                dotFile.open("cg.dot");
+                computationGraph.toDot(dotFile);
+                dotFile.close();
 #endif
+                *out << ei->first << "#" << ei->second << " <- " << tls->taskID
+                     << "#" << tls->taskEpoch << " is "
+                     << computationGraph.isReachable2(
+                            ei->first, ei->second, tls->taskID, tls->taskEpoch)
+                     << std::endl;
                 PIN_ExitProcess(1);
             }
         }
@@ -1565,15 +1643,16 @@ void recordMemWrite(THREADID tid, void* addr, uint32_t size, ADDRINT sp,
                 *out << ei->first << "#" << ei->second << " is conflict with "
                      << tls->taskID << "#" << tls->taskEpoch << std::endl;
 #ifdef OUTPUT_SOURCE
-                *out << "previous: " << getSourceInfo(ips[ei->first]) << std::endl; 
+                *out << "previous: " << getSourceInfo(ips[ei->first])
+                     << std::endl;
                 *out << "write:  " << getSourceInfo(ip) << std::endl;
 #endif
 
 #ifdef OUTPUT_CG
-                 ofstream dotFile;
-                 dotFile.open("cg.dot");
-                 computationGraph.toDot(dotFile);
-                 dotFile.close();
+                ofstream dotFile;
+                dotFile.open("cg.dot");
+                computationGraph.toDot(dotFile);
+                dotFile.close();
 #endif
                 PIN_ExitProcess(1);
             }
@@ -1701,7 +1780,7 @@ int main(int argc, char* argv[]) {
              << std::endl;
         PIN_ExitProcess(1);
     }
-#ifdef GRAPH_CONSTRUCTION    
+#ifdef GRAPH_CONSTRUCTION
     PIN_AddThreadStartFunction(threadStart, NULL);
     PIN_AddThreadFiniFunction(threadFini, NULL);
     IMG_AddInstrumentFunction(overload, 0);
