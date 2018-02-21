@@ -24,15 +24,15 @@
 #include "ocr-types.h"
 
 //#define DEBUG
-//#define GRAPH_CONSTRUCTION
-//#define INSTRUMENT
-//#define DETECT_RACE
-//#define MEASURE_TIME
+#define GRAPH_CONSTRUCTION
+#define INSTRUMENT
+#define DETECT_RACE
+#define MEASURE_TIME
 //#define STATISTICS
 //#define OUTPUT_CG
 //#define OUTPUT_SOURCE
 //#define COUNT_OPS
-
+//#define DEPTH
 
 class Node;
 class Task;
@@ -53,7 +53,7 @@ const uint32_t NULL_ID = 0;
 
 const uint32_t START_EPOCH = 0;
 const uint32_t END_EPOCH = 0xFFFFFFFF;
-
+const uint64_t EMPTY_SM = 0;
 uint32_t nextTaskID = 1;
 
 // guid ---> task ID map
@@ -94,6 +94,19 @@ inline uint64_t generateTaskID() {
 
 inline uint64_t generateCacheKey(const uint64_t& id1, const uint64_t& id2) {
     return (id1 << 32) | id2;
+}
+
+inline uint64_t generateSMField(const uint64_t& id, const uint32_t& epoch) {
+    return (id << 32) | (uint64_t)epoch;
+}
+
+struct Step {
+    uint64_t taskID;
+    uint32_t epoch;
+};
+
+inline Step splitSMField(const uint64_t& smField) {
+    return {smField >> 32, (uint32_t)smField};
 }
 
 /**
@@ -181,7 +194,7 @@ std::string getSourceInfo(ADDRINT ip) {
 }
 
     ////////////////////////////////////////////////////////////////////////////////
-    //                            Computation Graph //
+    //                            Computation Graph                              //
     ///////////////////////////////////////////////////////////////////////////////
 
 #ifdef OUTPUT_CG
@@ -659,89 +672,71 @@ ComputationGraph computationGraph(10000);
 //                                Shadow Memory                              //
 ///////////////////////////////////////////////////////////////////////////////
 
-class AccessRecord {
-   public:
-    uint64_t taskID;
-    uint32_t epoch;
-    int32_t ref;
-    ADDRINT ip;
-
-   public:
-    AccessRecord() : AccessRecord(NULL_ID, START_EPOCH, 0) {}
-    AccessRecord(uint64_t taskID, uint32_t epoch, ADDRINT ip)
-        : taskID(taskID), epoch(epoch), ref(0), ip(ip) {}
-    AccessRecord& operator=(const AccessRecord& other) {
-        this->taskID = other.taskID;
-        this->epoch = other.epoch;
-        this->ip = other.ip;
-        this->ref = 0;
-        return *this;
-    }
-    bool isEmpty() { return taskID == NULL_ID; }
-    void increaseRef() { ATOMIC::OPS::Increment(&ref, (int32_t)1); }
-    void decreaseRef() {
-        int oldVal = ATOMIC::OPS::Increment(&ref, (int32_t)-1);
-        if (oldVal == 1) {
-            delete this;
-        }
-    }
-
-    std::string getLocation() {
-        return getSourceInfo(ip);
-    }
-
-    virtual ~AccessRecord() {}
-};
+//class AccessRecord {
+   //public:
+    //uint64_t taskID;
+    //uint32_t epoch;
+    //int32_t ref;
+    //ADDRINT ip;
+//
+   //public:
+    //AccessRecord() : AccessRecord(NULL_ID, START_EPOCH, 0) {}
+    //AccessRecord(uint64_t taskID, uint32_t epoch, ADDRINT ip)
+        //: taskID(taskID), epoch(epoch), ref(0), ip(ip) {}
+    //AccessRecord& operator=(const AccessRecord& other) {
+        //this->taskID = other.taskID;
+        //this->epoch = other.epoch;
+        //this->ip = other.ip;
+        //this->ref = 0;
+        //return *this;
+    //}
+    //bool isEmpty() { return taskID == NULL_ID; }
+    //void increaseRef() { ATOMIC::OPS::Increment(&ref, (int32_t)1); }
+    //void decreaseRef() {
+        //int oldVal = ATOMIC::OPS::Increment(&ref, (int32_t)-1);
+        //if (oldVal == 1) {
+            //delete this;
+        //}
+    //}
+//
+    //std::string getLocation() {
+        //return getSourceInfo(ip);
+    //}
+//
+    //virtual ~AccessRecord() {}
+//};
 
 class ByteSM {
    private:
-    AccessRecord* write;
-    std::unordered_map<uint64_t, AccessRecord*> reads;
+    uint64_t write;
+    std::unordered_map<uint64_t, uint32_t> reads;
     PIN_RWMUTEX rwLock;
 
    public:
-    ByteSM() : write(nullptr), reads() {
+    ByteSM() : write(EMPTY_SM), reads() {
         if (!PIN_RWMutexInit(&rwLock)) {
             cerr << "Fail to initialize RW lock" << std::endl;
             PIN_ExitProcess(1);
         }
     }
     virtual ~ByteSM() {
-        write->decreaseRef();
-        for (auto it = reads.begin(), ie = reads.end(); it != ie; it++) {
-            it->second->decreaseRef();
-        }
         PIN_RWMutexFini(&rwLock);
     }
     bool hasRead() { return !reads.empty(); }
-    bool hasWrite() { return write != nullptr; }
-    void updateWrite(AccessRecord* other) {
+    bool hasWrite() { return write != EMPTY_SM; }
+    void updateWrite(uint64_t taskID, uint64_t epoch) {
         PIN_RWMutexWriteLock(&rwLock);
-        if (this->write) {
-            this->write->decreaseRef();
-        }
-        this->write = other;
-        for (auto it = reads.begin(), ie = reads.end(); it != ie; it++) {
-            it->second->decreaseRef();
-        }
+        this->write = generateSMField(taskID, epoch);
         this->reads.clear();
         PIN_RWMutexUnlock(&rwLock);
-        other->increaseRef();
     }
-    void updateRead(AccessRecord* other) {
+    void updateRead(uint64_t taskID, uint64_t epoch) {
         PIN_RWMutexWriteLock(&rwLock);
-        auto it = reads.find(other->taskID);
-        if (it == reads.end()) {
-            reads.insert(std::make_pair(other->taskID, other));
-        } else {
-            it->second->decreaseRef();
-            it->second = other;
-        }
+        this->reads[taskID] = epoch; 
         PIN_RWMutexUnlock(&rwLock);
-        other->increaseRef();
     }
-    std::unordered_map<uint64_t, AccessRecord*>& getReads() { return reads; }
-    AccessRecord* getWrite() { return write; }
+    std::unordered_map<uint64_t, uint32_t>& getReads() { return reads; }
+    uint64_t getWrite() { return write; }
     void readLock() { PIN_RWMutexReadLock(&rwLock); }
     void readUnlock() { PIN_RWMutexUnlock(&rwLock); }
     friend void recordMemRead(THREADID tid, void* addr, uint32_t size,
@@ -762,18 +757,17 @@ class DataBlockSM {
         byteArray = new ByteSM[length]();
     }
     virtual ~DataBlockSM() {}
-    void update(uintptr_t address, unsigned size, AccessRecord* ar,
-                bool isRead) {
+    void update(uintptr_t address, unsigned size, uint64_t taskID, uint32_t epoch, bool isRead) {
         // cout << (isRead ? "read" : "write") << endl;
         uint64_t offset = address - startAddress;
         assert(offset >= 0 && offset < length);
         if (isRead) {
             for (unsigned i = 0; i < size; i++) {
-                byteArray[offset + i].updateRead(ar);
+                byteArray[offset + i].updateRead(taskID, epoch);
             }
         } else {
             for (unsigned i = 0; i < size; i++) {
-                byteArray[offset + i].updateWrite(ar);
+                byteArray[offset + i].updateWrite(taskID, epoch);
             }
         }
     }
@@ -1417,56 +1411,32 @@ void recordMemRead(THREADID tid, void* addr, uint32_t size, ADDRINT sp,
         static_cast<ThreadLocalStore*>(PIN_GetThreadData(tls_key, tid));
     DataBlockSM* db = tls->getDB((uintptr_t)addr);
     std::unordered_map<uint64_t, uint32_t> epochs;
-    std::set<AccessRecord*> ars;
-#ifdef OUTPUT_SOURCE
-    std::unordered_map<uint64_t, ADDRINT> ips;
-#endif
     if (db) {
         uintptr_t offset = (uintptr_t)addr - db->startAddress;
         for (uintptr_t i = 0; i < size; i++) {
             ByteSM& byteSM = db->byteArray[offset + i];
+            uint64_t lastWrite = EMPTY_SM;
             byteSM.readLock();
             if (byteSM.hasWrite()) {
-                AccessRecord* write = byteSM.getWrite();
+                lastWrite = byteSM.getWrite();
 #ifdef COUNT_OPS
        ATOMIC::OPS::Increment(&comparison, (uint64_t)1); 
 #endif
-
-                if (ars.find(write) == ars.end()) {
-                    ars.insert(write);
-                    auto it = epochs.find(write->taskID);
-                    if (it == epochs.end()) {
-                        epochs.insert(
-                            std::make_pair(write->taskID, write->epoch));
-#ifdef OUTPUT_SOURCE
-                        ips.insert(std::make_pair(write->taskID, write->ip));
-#endif
-                    } else if (write->epoch > it->second) {
-                        it->second = write->epoch;
-#ifdef OUTPUT_SOURCE
-                        ips[write->taskID] = write->ip;
-#endif
-                    }
-                }
             }
             byteSM.readUnlock();
+            if (lastWrite != EMPTY_SM) {
+                Step s = splitSMField(lastWrite);
+                auto it = epochs.find(s.taskID);
+                if (it == epochs.end()) {
+                    epochs.insert(std::make_pair(s.taskID, s.epoch));
+                } else if (s.epoch > it->second) {
+                    it->second = s.epoch;
+                }
+            }
         }
 
-        AccessRecord* ar = new AccessRecord(tls->taskID, tls->taskEpoch, ip);
-        db->update((uintptr_t)addr, size, ar, true);
+        db->update((uintptr_t)addr, size, tls->taskID, tls->taskEpoch, true);
 #ifdef DETECT_RACE
-        // if (epochs.size() == 1) {
-        // auto ei = epochs.begin();
-        // if (!computationGraph.isReachable(ei->first, ei->second, tls->taskID,
-        // tls->taskEpoch)) { *out << "read-write race" << std::endl;
-        // PIN_ExitProcess(1);
-        //}
-        //} else {
-        // if (!computationGraph.isReachable(epochs, tls->taskID,
-        // tls->taskEpoch)) { *out << "read-write race" << std::endl;
-        // PIN_ExitProcess(1);
-        //}
-        //}
         for (auto ei = epochs.begin(), ee = epochs.end(); ei != ee; ei++) {
             if (!computationGraph.isReachable(ei->first, ei->second,
                                               tls->taskID, tls->taskEpoch)) {
@@ -1497,35 +1467,25 @@ void recordMemWrite(THREADID tid, void* addr, uint32_t size, ADDRINT sp,
         static_cast<ThreadLocalStore*>(PIN_GetThreadData(tls_key, tid));
     DataBlockSM* db = tls->getDB((uintptr_t)addr);
     std::unordered_map<uint64_t, uint32_t> epochs;
-    std::set<AccessRecord*> ars;
-#ifdef OUTPUT_SOURCE
-    std::unordered_map<uint64_t, ADDRINT> ips;
-#endif
     if (db) {
         uintptr_t offset = (uintptr_t)addr - db->startAddress;
         for (uintptr_t i = 0; i < size; i++) {
             ByteSM& byteSM = db->byteArray[offset + i];
+            uint64_t lastWrite = EMPTY_SM;
             byteSM.readLock();
             if (byteSM.hasWrite()) {
-                AccessRecord* write = byteSM.getWrite();
+                lastWrite = byteSM.getWrite();
 #ifdef COUNT_OPS
        ATOMIC::OPS::Increment(&comparison, (uint64_t)1); 
 #endif
-                if (ars.find(write) == ars.end()) {
-                    ars.insert(write);
-                    auto it = epochs.find(write->taskID);
-                    if (it == epochs.end()) {
-                        epochs.insert(
-                            std::make_pair(write->taskID, write->epoch));
-#ifdef OUTPUT_SOURCE
-                        ips.insert(std::make_pair(write->taskID, write->ip));
-#endif
-                    } else if (write->epoch > it->second) {
-                        it->second = write->epoch;
-#ifdef OUTPUT_SOURCE
-                        ips[write->taskID] = write->ip;
-#endif
-                    }
+            }
+            if (lastWrite != EMPTY_SM) {
+            Step s = splitSMField(lastWrite);
+                auto it = epochs.find(s.taskID);
+                if (it == epochs.end()) {
+                    epochs.insert(std::make_pair(s.taskID, s.epoch));
+                } else if (s.epoch > it->second) {
+                    it->second = s.epoch;
                 }
             }
             if (byteSM.hasRead()) {
@@ -1535,47 +1495,20 @@ void recordMemWrite(THREADID tid, void* addr, uint32_t size, ADDRINT sp,
                 for (auto rt = byteSM.getReads().begin(),
                           re = byteSM.getReads().end();
                      rt != re; ++rt) {
-                    AccessRecord* read = rt->second;
-                    if (ars.find(read) == ars.end()) {
-                        ars.insert(read);
-                        auto it = epochs.find(read->taskID);
-                        if (it == epochs.end()) {
-                            epochs.insert(
-                                std::make_pair(read->taskID, read->epoch));
-#ifdef OUTPUT_SOURCE
-                            ips.insert(std::make_pair(read->taskID, read->ip));
-#endif
-                        } else if (read->epoch > it->second) {
-                            it->second = read->epoch;
-#ifdef OUTPUT_SOURCE
-                            ips[read->taskID] = read->ip;
-#endif
-                        }
+                    auto it = epochs.find(rt->first);
+                    if (it == epochs.end()) {
+                        epochs.insert(std::make_pair(rt->first, rt->second));
+                    } else if (rt->second > it->second) {
+                        it->second = rt->second;
                     }
                 }
             }
             byteSM.readUnlock();
         }
 
-        AccessRecord* ar = new AccessRecord(tls->taskID, tls->taskEpoch, ip);
-        db->update(uintptr_t(addr), size, ar, false);
+        db->update(uintptr_t(addr), size, tls->taskID, tls->taskEpoch, false);
 
 #ifdef DETECT_RACE
-        // if (epochs.size() == 1) {
-        // auto ei = epochs.begin();
-        // if (!computationGraph.isReachable(ei->first, ei->second,
-        // tls->taskID, tls->taskEpoch)) {
-        //*out << "write race" << std::endl;
-        // PIN_ExitProcess(1);
-        //}
-        //} else {
-        // if (!computationGraph.isReachable(epochs, tls->taskID,
-        // tls->taskEpoch)) {
-        //*out << "write race" << std::endl;
-        // PIN_ExitProcess(1);
-        //}
-        //}
-
         for (auto ei = epochs.begin(), ee = epochs.end(); ei != ee; ei++) {
             if (!computationGraph.isReachable(ei->first, ei->second,
                                               tls->taskID, tls->taskEpoch)) {
