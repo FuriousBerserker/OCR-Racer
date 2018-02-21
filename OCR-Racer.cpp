@@ -258,6 +258,13 @@ class Node {
     void addDeps(uint64_t id, Dep& dep);
 
     friend class ComputationGraph;
+
+#ifdef DEPTH
+   public:
+    uint64_t depth;
+    void calculateDepth();
+    uint64_t getDepth();
+#endif
 };
 
 class Task : public Node {
@@ -321,7 +328,11 @@ Node::Node(uint64_t id, Type type, Task* parent, uint32_t parentEpoch)
       parent(parent),
       parentEpoch(parentEpoch),
       type(type),
-      id(id) {}
+      id(id)
+#ifdef DEPTH
+    ,depth(0)
+#endif
+      {}
 
 Node::~Node() {}
 
@@ -330,6 +341,38 @@ inline void Node::addDeps(uint64_t id, Dep& dep) {
     incomingEdges.put(id, copy);
     //*out << id << "#" << dep.epoch << "->" << this->id << std::endl;
 }
+
+#ifdef DEPTH
+inline void Node::calculateDepth() {
+//  to avoid race
+    uint64_t internal_depth = 0;
+    for (auto ei = incomingEdges.begin(), ee = incomingEdges.end(); ei != ee;
+         ++ei) {
+        Node* prev = (*ei).second->src;
+        uint64_t prevDepth = prev->getDepth();
+        //*out << prev->id << " # " << prevDepth << " -> " << id << std::endl;
+        if (internal_depth < prevDepth) {
+            internal_depth = prevDepth;
+        }
+    }
+
+    if (parent) {
+        uint64_t parentDepth = parent->getDepth();
+        if (internal_depth < parentDepth) {
+            internal_depth = parentDepth;
+        }
+    }
+    internal_depth += 1;
+    depth = internal_depth;
+}
+
+inline uint64_t Node::getDepth() {
+    if (depth == 0) {
+        calculateDepth();
+    }
+    return depth;
+}
+#endif
 
 Task::Task(uint64_t id, Task* parent, uint32_t parentEpoch)
     : Node(id, Node::TASK, parent, parentEpoch) {}
@@ -374,6 +417,9 @@ bool ComputationGraph::isReachable(uint64_t srcID, uint32_t srcEpoch,
         return true;
     }
     Node* dstNode = nodeMap.get(dstID);
+#ifdef DEPTH
+    Node* srcNode = nodeMap.get(srcID);
+#endif
     bool result = false;
 #ifdef COUNT_OPS
     uint64_t cacheKey = generateCacheKey(srcID, dstID);
@@ -410,7 +456,11 @@ bool ComputationGraph::isReachable(uint64_t srcID, uint32_t srcEpoch,
                 result = true;
                 break;
             }
-            if (next->parent && next->parent->id != srcID) {
+            if (next->parent && next->parent->id != srcID
+#ifdef DEPTH
+    && next->parent->getDepth() > srcNode->getDepth()
+#endif
+            ) {
                 if (accessedNodes.find(next->parent->id) ==
                     accessedNodes.end()) {
                     accessedNodes.insert(next->parent->id);
@@ -428,6 +478,11 @@ bool ComputationGraph::isReachable(uint64_t srcID, uint32_t srcEpoch,
                 if (ancestor->id == srcID) {
                     continue;
                 }
+#ifdef DEPTH
+                if (ancestor->getDepth() <= srcNode->getDepth()) {
+                    continue;
+                }
+#endif
                 while ((ancestor->type == Node::EVENT &&
                         ancestor->incomingEdges.getSize() == 1) ||
                        (ancestor->type == Node::TASK &&
@@ -930,6 +985,10 @@ void preEdt(THREADID tid, ocrGuid_t edtGuid, uint32_t paramc, uint64_t* paramv,
         static_cast<ThreadLocalStore*>(PIN_GetThreadData(tls_key, tid));
     tls->initialize(taskID, depc, depv);
     tls->increaseEpoch();
+#ifdef DEPTH
+    Node* task = computationGraph.getNode(taskID);
+    task->calculateDepth();
+#endif
 #ifdef DEBUG
     *out << "preEdt finish" << std::endl;
 #endif
