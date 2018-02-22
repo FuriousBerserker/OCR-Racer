@@ -33,6 +33,7 @@
 //#define OUTPUT_SOURCE
 //#define COUNT_OPS
 //#define DEPTH
+//#define MEASURE_DB
 
 class Node;
 class Task;
@@ -47,6 +48,10 @@ struct timeval program_start, program_end;
 uint64_t comparison = 0;
 uint64_t unique_graph_traversal = 0;
 uint64_t overall_steps = 0;
+#endif
+
+#ifdef MEASURE_DB
+std::set<uint64_t> dbSizeSet;
 #endif
 
 const uint32_t NULL_ID = 0;
@@ -419,6 +424,7 @@ bool ComputationGraph::isReachable(uint64_t srcID, uint32_t srcEpoch,
     Node* dstNode = nodeMap.get(dstID);
 #ifdef DEPTH
     Node* srcNode = nodeMap.get(srcID);
+    assert(srcNode);
 #endif
     bool result = false;
 #ifdef COUNT_OPS
@@ -828,6 +834,7 @@ class DataBlockSM {
     }
 
     friend class ThreadLocalStore;
+    friend class ShadowMemory;
     friend void recordMemRead(THREADID tid, void* addr, uint32_t size,
                               ADDRINT sp, ADDRINT ip);
     friend void recordMemWrite(THREADID tid, void* addr, uint32_t size,
@@ -849,6 +856,18 @@ class ShadowMemory {
     virtual ~ShadowMemory() {}
     void insertDB(uint64_t id, DataBlockSM* db) { dbMap.put(id, db); }
     DataBlockSM* getDB(uint64_t id) { return dbMap.get(id); }
+#ifdef MEASURE_DB
+    void outputDBSize() {
+        for (auto di = dbMap.begin(), de = dbMap.end(); di != de; ++di) {
+            DataBlockSM* dbSM = (*di).second;
+            dbSizeSet.insert(dbSM->length);
+        }
+        for (auto si = dbSizeSet.begin(), se = dbSizeSet.end(); si != se; ++si) {
+            *out << *si << ",";
+        }
+        *out << std::endl;
+    }
+#endif
 };
 
 ShadowMemory sm(10000);
@@ -987,7 +1006,9 @@ void preEdt(THREADID tid, ocrGuid_t edtGuid, uint32_t paramc, uint64_t* paramv,
     tls->increaseEpoch();
 #ifdef DEPTH
     Node* task = computationGraph.getNode(taskID);
-    task->calculateDepth();
+    if (task) {
+        task->calculateDepth();
+    }
 #endif
 #ifdef DEBUG
     *out << "preEdt finish" << std::endl;
@@ -1230,6 +1251,10 @@ void fini(int32_t code, void* v) {
     *out << "comparison: " << ATOMIC::OPS::Load(&comparison) << std::endl;
     *out << "unique_comparison: " << ATOMIC::OPS::Load(&unique_graph_traversal) << std::endl;
     *out << "overall_steps: " << ATOMIC::OPS::Load(&overall_steps) << std::endl;
+#endif
+
+#ifdef MEASURE_DB
+    sm.outputDBSize();
 #endif
     // errorFile.close();
     // logFile.close();
