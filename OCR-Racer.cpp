@@ -8,6 +8,7 @@
 #include <cinttypes>
 #include <cstddef>
 #include <ctime>
+#include <cstdlib>
 #include <fstream>
 #include <iostream>
 #include <map>
@@ -34,6 +35,7 @@
 //#define COUNT_OPS
 //#define DEPTH
 //#define MEASURE_DB
+//#define BOUND
 
 class Node;
 class Task;
@@ -52,6 +54,12 @@ uint64_t overall_steps = 0;
 
 #ifdef MEASURE_DB
 std::set<uint64_t> dbSizeSet;
+#endif
+
+#ifdef BOUND
+KNOB<string> KnobBound(KNOB_MODE_WRITEONCE, "pintool",
+    "bound", "0xFFFFFFFF", "specify db size bound");
+uint64_t boundDBSize = 0;
 #endif
 
 const uint32_t NULL_ID = 0;
@@ -1496,6 +1504,11 @@ void recordMemRead(THREADID tid, void* addr, uint32_t size, ADDRINT sp,
     DataBlockSM* db = tls->getDB((uintptr_t)addr);
     std::unordered_map<uint64_t, uint32_t> epochs;
     if (db) {
+#ifdef BOUND
+        if (db->length > boundDBSize) {
+            return;
+        }
+#endif
         uintptr_t offset = (uintptr_t)addr - db->startAddress;
         for (uintptr_t i = 0; i < size; i++) {
             ByteSM& byteSM = db->byteArray[offset + i];
@@ -1552,6 +1565,11 @@ void recordMemWrite(THREADID tid, void* addr, uint32_t size, ADDRINT sp,
     DataBlockSM* db = tls->getDB((uintptr_t)addr);
     std::unordered_map<uint64_t, uint32_t> epochs;
     if (db) {
+#ifdef BOUND
+        if (db->length > boundDBSize) {
+            return;
+        }
+#endif
         uintptr_t offset = (uintptr_t)addr - db->startAddress;
         for (uintptr_t i = 0; i < size; i++) {
             ByteSM& byteSM = db->byteArray[offset + i];
@@ -1707,7 +1725,11 @@ void init(int argc, char* argv[]) {
     userCodeImg = argv[argi + 1];
     *out << "User image is " << userCodeImg << std::endl;
     initSkippedLibrary();
-
+#ifdef BOUND
+    char* end_pos;
+    boundDBSize = std::strtoul(KnobBound.Value().c_str(), &end_pos, 10); 
+    *out << "boundSize: " << boundDBSize << endl;
+#endif
     // logFile.open("log.txt");
     // errorFile.open("error.txt");
 }
