@@ -1014,6 +1014,7 @@ void preEdt(THREADID tid, ocrGuid_t edtGuid, uint32_t paramc, uint64_t* paramv,
     tls->increaseEpoch();
 #ifdef DEPTH
     Node* task = computationGraph.getNode(taskID);
+    //bug: cholesky & fib fail once in 10 times
     if (task) {
         task->calculateDepth();
     }
