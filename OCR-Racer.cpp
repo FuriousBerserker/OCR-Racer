@@ -429,6 +429,11 @@ bool ComputationGraph::isReachable(uint64_t srcID, uint32_t srcEpoch,
     if (srcID == dstID) {
         return true;
     }
+
+#ifdef COUNT_OPS
+    ATOMIC::OPS::Increment(&comparison, (uint64_t)1); 
+#endif
+
     Node* dstNode = nodeMap.get(dstID);
 #ifdef DEPTH
     Node* srcNode = nodeMap.get(srcID);
@@ -1517,9 +1522,9 @@ void recordMemRead(THREADID tid, void* addr, uint32_t size, ADDRINT sp,
             byteSM.readLock();
             if (byteSM.hasWrite()) {
                 lastWrite = byteSM.getWrite();
-#ifdef COUNT_OPS
-       ATOMIC::OPS::Increment(&comparison, (uint64_t)1); 
-#endif
+//#ifdef COUNT_OPS
+       //ATOMIC::OPS::Increment(&comparison, (uint64_t)1); 
+//#endif
             }
             byteSM.readUnlock();
             if (lastWrite != EMPTY_SM) {
@@ -1578,9 +1583,9 @@ void recordMemWrite(THREADID tid, void* addr, uint32_t size, ADDRINT sp,
             byteSM.readLock();
             if (byteSM.hasWrite()) {
                 lastWrite = byteSM.getWrite();
-#ifdef COUNT_OPS
-       ATOMIC::OPS::Increment(&comparison, (uint64_t)1); 
-#endif
+//#ifdef COUNT_OPS
+       //ATOMIC::OPS::Increment(&comparison, (uint64_t)1); 
+//#endif
             }
             if (lastWrite != EMPTY_SM) {
             Step s = splitSMField(lastWrite);
@@ -1592,9 +1597,9 @@ void recordMemWrite(THREADID tid, void* addr, uint32_t size, ADDRINT sp,
                 }
             }
             if (byteSM.hasRead()) {
-#ifdef COUNT_OPS
-       ATOMIC::OPS::Increment(&comparison, (uint64_t)(byteSM.getReads().size())); 
-#endif
+//#ifdef COUNT_OPS
+       //ATOMIC::OPS::Increment(&comparison, (uint64_t)(byteSM.getReads().size())); 
+//#endif
                 for (auto rt = byteSM.getReads().begin(),
                           re = byteSM.getReads().end();
                      rt != re; ++rt) {
