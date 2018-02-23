@@ -440,15 +440,14 @@ bool ComputationGraph::isReachable(uint64_t srcID, uint32_t srcEpoch,
     assert(srcNode);
 #endif
     bool result = false;
-#ifdef COUNT_OPS
     uint64_t cacheKey = generateCacheKey(srcID, dstID);
     uint32_t cacheEpoch = cacheMap.get(cacheKey);
 
     if (cacheEpoch >= srcEpoch) {
         return true;
-    } else {
-        ATOMIC::OPS::Increment(&unique_graph_traversal, (uint64_t)1);
     }
+#ifdef COUNT_OPS
+    ATOMIC::OPS::Increment(&unique_graph_traversal, (uint64_t)1);
     uint64_t local_steps = 1;
 #endif
     std::queue<Node*> q;
