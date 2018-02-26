@@ -27,14 +27,14 @@
 #include "ocr-types.h"
 
 //#define DEBUG
-#define GRAPH_CONSTRUCTION
-#define INSTRUMENT
-#define DETECT_RACE
-#define MEASURE_TIME
+//#define GRAPH_CONSTRUCTION
+//#define INSTRUMENT
+//#define DETECT_RACE
+//#define MEASURE_TIME
 //#define STATISTICS
 //#define OUTPUT_CG
 //#define OUTPUT_SOURCE
-#define COUNT_OPS
+//#define COUNT_OPS
 //#define DEPTH
 //#define MEASURE_DB
 //#define BOUND
