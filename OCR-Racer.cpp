@@ -9,6 +9,8 @@
 #include <cstddef>
 #include <ctime>
 #include <cstdlib>
+#include <cmath>
+#include <cfloat>
 #include <fstream>
 #include <iostream>
 #include <map>
@@ -25,14 +27,14 @@
 #include "ocr-types.h"
 
 //#define DEBUG
-//#define GRAPH_CONSTRUCTION
-//#define INSTRUMENT
-//#define DETECT_RACE
-//#define MEASURE_TIME
+#define GRAPH_CONSTRUCTION
+#define INSTRUMENT
+#define DETECT_RACE
+#define MEASURE_TIME
 //#define STATISTICS
 //#define OUTPUT_CG
 //#define OUTPUT_SOURCE
-//#define COUNT_OPS
+#define COUNT_OPS
 //#define DEPTH
 //#define MEASURE_DB
 //#define BOUND
@@ -49,7 +51,8 @@ struct timeval program_start, program_end;
 #ifdef COUNT_OPS
 uint64_t comparison = 0;
 uint64_t unique_graph_traversal = 0;
-uint64_t overall_steps = 0;
+std::vector<double> step_counts;
+PIN_MUTEX count_op_mutex;
 #endif
 
 #ifdef MEASURE_DB
@@ -206,9 +209,38 @@ std::string getSourceInfo(ADDRINT ip) {
     return ss.str();
 }
 
-    ////////////////////////////////////////////////////////////////////////////////
-    //                            Computation Graph                              //
-    ///////////////////////////////////////////////////////////////////////////////
+double geometric_mean(std::vector<double> const & data)
+{
+    long long ex = 0;
+    auto do_bucket = [&data,&ex](int first,int last) -> double
+    {
+        double ans = 1.0;
+        for ( ;first != last;++first)
+        {
+            int i;
+            ans *= std::frexp(data[first],&i);
+            ex+=i;
+        }
+        return ans;
+    };
+
+    const int bucket_size = -1 * log2( std::numeric_limits<double>::min() );
+    std::size_t buckets = data.size() / bucket_size;
+
+    double invN = 1.0 / data.size();
+    double m = 1.0;
+
+    for (std::size_t i = 0;i < buckets;++i)
+        m *= std::pow( do_bucket(i * bucket_size,(i+1) * bucket_size),invN );
+
+    m*= std::pow( do_bucket( buckets * bucket_size, data.size() ),invN );
+
+    return std::pow(FLT_RADIX, ex * invN ) * m;
+}
+
+////////////////////////////////////////////////////////////////////////////////
+//                            Computation Graph                              //
+///////////////////////////////////////////////////////////////////////////////
 
 #ifdef OUTPUT_CG
 class ColorScheme {
@@ -525,7 +557,16 @@ bool ComputationGraph::isReachable(uint64_t srcID, uint32_t srcEpoch,
                             result = true;
                             updateCache(srcID, srcEpoch, dstID);
 #ifdef COUNT_OPS
-                    ATOMIC::OPS::Increment(&overall_steps, local_steps);
+                            PIN_MutexLock(&count_op_mutex);
+                            //uint64_t multiplication_result = average_steps_temp * local_steps;
+                            //if (multiplication_result / local_steps != average_steps_temp) {
+                                //average_steps *= std::sqrt((double)average_steps_temp);
+                                //average_steps_temp = local_steps;
+                            //} else {
+                                //average_steps_temp = multiplication_result;
+                            //}
+                            step_counts.push_back(local_steps);
+                            PIN_MutexUnlock(&count_op_mutex);
 #endif
                             return result;
                         } else {
@@ -550,7 +591,9 @@ bool ComputationGraph::isReachable(uint64_t srcID, uint32_t srcEpoch,
         updateCache(srcID, srcEpoch, dstID);
     }
 #ifdef COUNT_OPS
-    ATOMIC::OPS::Increment(&overall_steps, local_steps);
+    PIN_MutexLock(&count_op_mutex);
+    step_counts.push_back(local_steps);
+    PIN_MutexUnlock(&count_op_mutex);
 #endif
 
     return result;
@@ -1263,7 +1306,7 @@ void fini(int32_t code, void* v) {
 #ifdef COUNT_OPS
     *out << "comparison: " << ATOMIC::OPS::Load(&comparison) << std::endl;
     *out << "unique_comparison: " << ATOMIC::OPS::Load(&unique_graph_traversal) << std::endl;
-    *out << "overall_steps: " << ATOMIC::OPS::Load(&overall_steps) << std::endl;
+    *out << "overall_steps: " << geometric_mean(step_counts) << std::endl;
 #endif
 
 #ifdef MEASURE_DB
@@ -1778,6 +1821,14 @@ int main(int argc, char* argv[]) {
 #ifdef MEASURE_TIME
     gettimeofday(&program_start, nullptr);
 #endif
+
+#ifdef COUNT_OPS
+    if (!PIN_MutexInit(&count_op_mutex)) {
+        std::cerr << "count_op_mutex initialization failed" << std::endl;
+        PIN_ExitProcess(1); 
+    }
+#endif
+
     PIN_StartProgram();
     return 0;
 }
